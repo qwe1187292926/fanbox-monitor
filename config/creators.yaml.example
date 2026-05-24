@@ -1,0 +1,22 @@
+# per-creator 规则
+# 字段：
+#   skip:          true/false，完全跳过该创作者
+#   fee_min:       覆盖全局 FANBOX_FEE_MIN，单位日元
+#   fee_max:       覆盖全局 FANBOX_FEE_MAX
+#   tags_include:  必须包含至少一个 tag
+#   tags_exclude:  包含任一 tag 则跳过
+#
+# 顶层 defaults 适用于所有未在 creators 里出现的创作者。
+
+defaults:
+  fee_min: 0
+
+creators:
+  someCreatorId:
+    fee_min: 2000     # 该创作者投稿 fee < 2000 不下载
+    fee_max: 10000
+  anotherCreator:
+    skip: true        # 完全跳过该创作者
+  thirdCreator:
+    tags_include:
+      - 差分
