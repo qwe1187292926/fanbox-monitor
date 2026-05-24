@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import random
 import time
+from pathlib import Path
 from typing import Optional
 
 from curl_cffi import requests as curl_requests
@@ -21,8 +22,8 @@ from parser.filename import render_filename
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 10
-CHUNK = 8192
-TIMEOUT = 60
+CHUNK = 65536      # 64 KiB；大文件下减少 Python ↔ libcurl 来回开销
+TIMEOUT = 300      # 大 zip 可能要几分钟才传完，60s 不够
 
 DOWNLOAD_HEADERS = {"Referer": "https://www.fanbox.cc/"}
 
@@ -30,6 +31,13 @@ DOWNLOAD_HEADERS = {"Referer": "https://www.fanbox.cc/"}
 def _backoff_sleep(attempt: int) -> None:
     wait = min(2 ** attempt + random.random(), 60.0)
     time.sleep(wait)
+
+
+def _tmp_size(tmp: Path) -> int:
+    try:
+        return tmp.stat().st_size if tmp.exists() else 0
+    except OSError:
+        return 0
 
 
 def download_file(
@@ -42,7 +50,8 @@ def download_file(
     流程：
     1. 渲染文件名 → 目标路径
     2. 目标文件已存在 → 返回 skipped_reason="existing"
-    3. 写到 .part 临时文件 → 原子 rename
+    3. 写到 .part 临时文件；失败时**保留 .part**，下次重试通过 HTTP Range 断点续传
+    4. 完整写完后原子 rename .part → target
     """
     relative = render_filename(item, settings.name_rule)
     target = settings.download_dir / relative
@@ -66,17 +75,28 @@ def download_file(
     last_error: Optional[str] = None
 
     for attempt in range(MAX_RETRIES):
+        resume_pos = _tmp_size(tmp)
+        headers = dict(DOWNLOAD_HEADERS)
+        if resume_pos > 0:
+            headers["Range"] = f"bytes={resume_pos}-"
+            logger.info(
+                "断点续传 %s（已有 %.2f MiB，attempt %d）",
+                relative, resume_pos / 1048576, attempt + 1,
+            )
+
         try:
             resp = session.get(
                 url,
                 stream=True,
                 impersonate="chrome120",
-                headers=DOWNLOAD_HEADERS,
+                headers=headers,
                 timeout=TIMEOUT,
             )
         except Exception as exc:
             last_error = f"net error: {exc}"
-            logger.warning("下载 %s 失败 (attempt %d): %s", url, attempt + 1, exc)
+            logger.warning(
+                "下载 %s 失败 (attempt %d): %s", url, attempt + 1, exc,
+            )
             _backoff_sleep(attempt)
             continue
 
@@ -86,16 +106,32 @@ def download_file(
         if status in (403, 404):
             if item.retry_url and not used_retry_url:
                 logger.warning(
-                    "%s 返回 %d，降级到 retry_url", url, status
+                    "%s 返回 %d，降级到 retry_url", url, status,
                 )
                 url = item.retry_url
                 used_retry_url = True
+                # 不同 URL 不能续传：清掉旧的 .part
+                if tmp.exists():
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
                 continue
             return DownloadResult(
-                item=item, success=False, error=f"HTTP {status}"
+                item=item, success=False, error=f"HTTP {status}",
             )
 
-        # 5xx：退避重试
+        # 416 Range Not Satisfiable：本地 .part 比远程文件还大，从头来
+        if status == 416:
+            logger.warning("%s 返回 416，重置 .part 重新下载", url)
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            continue
+
+        # 5xx：退避重试（保留 .part 用于续传）
         if status >= 500:
             last_error = f"HTTP {status}"
             logger.warning("%s 返回 %d (attempt %d)", url, status, attempt + 1)
@@ -104,23 +140,36 @@ def download_file(
 
         if status >= 400:
             return DownloadResult(
-                item=item, success=False, error=f"HTTP {status}"
+                item=item, success=False, error=f"HTTP {status}",
             )
 
-        # 成功：流式写入临时文件
+        # 200 = 全量；206 = 续传
+        if status == 206:
+            file_mode = "ab"
+        elif status == 200:
+            if resume_pos > 0:
+                logger.info("服务器忽略 Range，从头下载 %s", url)
+            file_mode = "wb"
+        else:
+            return DownloadResult(
+                item=item, success=False, error=f"unexpected status {status}",
+            )
+
         try:
-            with tmp.open("wb") as f:
+            with tmp.open(file_mode) as f:
                 for chunk in resp.iter_content(chunk_size=CHUNK):
                     if chunk:
                         f.write(chunk)
             tmp.replace(target)
         except Exception as exc:
+            # 写入过程中网络中断 / HTTP/2 stream reset 等。
+            # **不删 .part**，下次循环用 Range 续传。
+            now_size = _tmp_size(tmp)
             last_error = f"write error: {exc}"
-            logger.warning("写入 %s 失败: %s", target, exc)
-            try:
-                tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
+            logger.warning(
+                "写入 %s 中断: %s (已下载 %.2f MiB，下次重试断点续传)",
+                target, exc, now_size / 1048576,
+            )
             _backoff_sleep(attempt)
             continue
 
@@ -128,11 +177,11 @@ def download_file(
             size = target.stat().st_size
         except OSError:
             size = None
-        logger.info("下载完成: %s (%s bytes)", relative, size)
+        logger.info("下载完成: %s (%.2f MiB)", relative, (size or 0) / 1048576)
         return DownloadResult(
-            item=item, success=True, local_path=str(target), size=size
+            item=item, success=True, local_path=str(target), size=size,
         )
 
     return DownloadResult(
-        item=item, success=False, error=last_error or "max retries exceeded"
+        item=item, success=False, error=last_error or "max retries exceeded",
     )
