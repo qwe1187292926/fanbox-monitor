@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterator
+from typing import Iterator, Optional
 
 from api.client import FanboxClient
 from api.endpoints import list_supporting_posts
@@ -31,14 +31,14 @@ def iter_new_supporting(
     - 本页所有 items 都已在 seen_posts；
     - 没有 nextUrl。
     """
-    new_max_dt: str | None = None
-    new_max_id: str | None = None
+    new_max_dt: Optional[str] = None
+    new_max_id: Optional[str] = None
 
     try:
         page = list_supporting_posts(client, limit=300)
     except Exception as exc:
         logger.error("supporting 首页拉取失败: %s", exc)
-        return
+        raise
 
     while True:
         body = page.get("body") or {}
@@ -77,7 +77,7 @@ def iter_new_supporting(
             page = client.get(next_url)
         except Exception as exc:
             logger.warning("supporting 翻页失败 %s: %s", next_url, exc)
-            break
+            raise
 
     if new_max_dt:
         repo.set_cursor(SCOPE, new_max_dt, new_max_id)

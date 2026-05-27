@@ -32,6 +32,7 @@ class Settings:
     # 路径
     download_dir: Path
     db_path: Path
+    log_level: str
 
     # 模式开关
     mode_supporting: bool
@@ -121,6 +122,14 @@ def _env_csv(name: str, default: list[str]) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+def _env_log_level(name: str, default: str = "INFO") -> str:
+    raw = (os.environ.get(name) or default).strip().upper()
+    allowed = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
+    if raw not in allowed:
+        raise ValueError(f"{name} 必须是以下之一: {', '.join(sorted(allowed))}")
+    return raw
+
+
 def _parse_rule(data: dict) -> CreatorRule:
     return CreatorRule(
         skip=bool(data.get("skip", False)),
@@ -193,25 +202,35 @@ def load_settings(project_root: Optional[Path] = None) -> Settings:
             creator_rules_source = str((root / candidate).resolve())
     default_rule, creator_rules = load_creator_rules(creator_rules_source)
 
+    concurrency = max(1, _env_int("FANBOX_CONCURRENCY", 3))
+    interval_sec = max(0.0, _env_float("FANBOX_INTERVAL_SEC", 3.0))
+    notify_min_new = max(0, _env_int("FANBOX_NOTIFY_MIN_NEW", 1))
+    first_run_max_posts = max(0, _env_int("FANBOX_FIRST_RUN_MAX_POSTS", 50))
+    post_403_retries = max(0, _env_int("FANBOX_POST_403_RETRIES", 3))
+    post_403_backoff_base = max(
+        0.0, _env_float("FANBOX_POST_403_BACKOFF_BASE", 30.0)
+    )
+
     return Settings(
         session=session,
         user_agent=user_agent,
         proxy=os.environ.get("FANBOX_PROXY") or None,
         download_dir=download_dir,
         db_path=db_path,
+        log_level=_env_log_level("FANBOX_LOG_LEVEL"),
         mode_supporting=_env_bool("FANBOX_MODE_SUPPORTING", True),
         mode_following=_env_bool("FANBOX_MODE_FOLLOWING", False),
-        interval_sec=_env_float("FANBOX_INTERVAL_SEC", 3.0),
-        concurrency=_env_int("FANBOX_CONCURRENCY", 3),
+        interval_sec=interval_sec,
+        concurrency=concurrency,
         ext_whitelist=ext_whitelist,
         fee_min=_env_int("FANBOX_FEE_MIN", 0),
         fee_max=_env_optional_int("FANBOX_FEE_MAX"),
         date_after=os.environ.get("FANBOX_DATE_AFTER") or None,
         name_rule=os.environ.get("FANBOX_NAME_RULE") or "{user}/{date}-{title}/{index}",
-        notify_min_new=_env_int("FANBOX_NOTIFY_MIN_NEW", 1),
-        first_run_max_posts=_env_int("FANBOX_FIRST_RUN_MAX_POSTS", 50),
-        post_403_retries=_env_int("FANBOX_POST_403_RETRIES", 3),
-        post_403_backoff_base=_env_float("FANBOX_POST_403_BACKOFF_BASE", 30.0),
+        notify_min_new=notify_min_new,
+        first_run_max_posts=first_run_max_posts,
+        post_403_retries=post_403_retries,
+        post_403_backoff_base=post_403_backoff_base,
         bark_server=(os.environ.get("FANBOX_BARK_SERVER") or "https://api.day.app").rstrip("/"),
         bark_device_key=(os.environ.get("FANBOX_BARK_DEVICE_KEY") or "").strip(),
         bark_group=(os.environ.get("FANBOX_BARK_GROUP") or "FanboxMonitor").strip(),

@@ -32,7 +32,7 @@ This project represents a complete Python port of the core crawling, filtering, 
 - **Dual Source Monitoring**: Independent toggles for Following and Supporting creator streams
 - **Per-Creator Thresholds**: Configurable minimum price filters (e.g., skip posts under ¥2000 from specific creators)
 - **Advanced Filtering**: Extension whitelisting, price range filtering, date range constraints
-- **SQLite Persistence**: Three-table schema for deduplication, incremental cursors, and execution logs
+- **SQLite Persistence**: Records processed posts, downloaded files, scan checkpoints, and execution logs
 - **Intelligent Retry System**: Automatic retry with `retry_url` fallback for thumbnail degradation
 - **Rate Limit Handling**: Smart backoff strategy (5-6 minutes) for 429 responses
 - **Multi-Channel Notifications**: Qinglong notify integration supporting Telegram, Bark, WeChat, PushPlus, and more
@@ -170,7 +170,7 @@ FanboxMonitor/
 │   └── http_downloader.py # Download with retry + retry_url fallback
 ├── storage/              # SQLite database layer
 │   ├── db.py             # Database schema and connection management
-│   └── repo.py           # CRUD operations for three-table schema
+│   └── repo.py           # CRUD operations for SQLite runtime state
 ├── notify/               # Notification bridge to Qinglong notify
 │   └── push.py           # Multi-channel notification dispatcher
 ├── models/               # TypedDict type definitions
@@ -225,7 +225,7 @@ FanboxMonitor follows a modular, pipeline-based architecture:
 ### Key Technical Decisions
 
 - **curl_cffi Integration**: Bypasses Fanbox anti-scraping through Chrome fingerprint emulation
-- **SQLite Persistence**: Three-table schema (posts, cursors, logs) ensures idempotent execution
+- **SQLite Persistence**: Four-table schema (`seen_posts`, `downloaded`, `cursor`, `run_log`) records deduplication state, download results, latest scan checkpoints, and execution logs
 - **Exponential Backoff**: 5-6 minute backoff on 429 responses prevents IP bans
 - **Retry URL Fallback**: Graceful degradation using thumbnail URLs when primary URLs fail
 

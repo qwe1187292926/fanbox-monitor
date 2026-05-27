@@ -2,13 +2,13 @@
 
 移植自 src/ts/InitHomePage.ts:110-141 + InitPageBase.ts:108-131。
 不再使用原项目的 paginateCreator 优化（那是冷启动建库用的），
-直接用 listCreator + nextUrl 翻页，每个 creator 单独维护 cursor。
+直接用 listCreator + nextUrl 翻页，靠 seen_posts 去重；cursor 仅记录最近扫描 checkpoint。
 本流自身不限量，整次 run 的全局配额由 main.py 管理。
 """
 from __future__ import annotations
 
 import logging
-from typing import Iterator
+from typing import Iterator, Optional
 
 from api.client import FanboxClient
 from api.endpoints import list_creator_posts, list_following
@@ -26,14 +26,14 @@ def _iter_creator_posts(
 ) -> Iterator[PostMeta]:
     scope = f"following:{creator_id}"
 
-    new_max_dt: str | None = None
-    new_max_id: str | None = None
+    new_max_dt: Optional[str] = None
+    new_max_id: Optional[str] = None
 
     try:
         page = list_creator_posts(client, creator_id, limit=300)
     except Exception as exc:
         logger.warning("creator %s 首页拉取失败: %s", creator_id, exc)
-        return
+        raise
 
     while True:
         body = page.get("body") or {}
@@ -78,7 +78,7 @@ def _iter_creator_posts(
             page = client.get(next_url)
         except Exception as exc:
             logger.warning("creator %s 翻页失败 %s: %s", creator_id, next_url, exc)
-            break
+            raise
 
     if new_max_dt:
         repo.set_cursor(scope, new_max_dt, new_max_id)
@@ -95,7 +95,7 @@ def iter_new_following(
         raw = list_following(client)
     except Exception as exc:
         logger.error("creator.listFollowing 失败: %s", exc)
-        return
+        raise
 
     creators = (raw.get("body") or {}).get("creators") or []
     logger.info("following 拉到 %d 个关注的创作者", len(creators))
