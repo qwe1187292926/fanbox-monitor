@@ -18,6 +18,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from api.client import FanboxClient
 from api.endpoints import get_post
@@ -32,6 +33,7 @@ from crawler.following import iter_new_following
 from crawler.interval import CrawlInterval
 from crawler.supporting import iter_new_supporting
 from downloader.http_downloader import download_file
+from i18n import t
 from models.types import CreatorInfo, DownloadResult, FileItem, PostMeta, RunStats
 from notify.push import format_run_summary, push_run_results, send_qinglong
 from parser.filter import accept_file
@@ -49,11 +51,104 @@ class _PostDownloadState:
     failed: bool = False
 
 
+def _redact_proxy(proxy: Optional[str], lang: str | None = None) -> str:
+    """Return a log-safe proxy string without credentials."""
+    if not proxy:
+        return t(lang, "common.not_configured")
+
+    try:
+        parts = urlsplit(proxy)
+    except ValueError:
+        if "@" in proxy:
+            return "***@" + proxy.rsplit("@", 1)[1]
+        return proxy
+
+    if "@" not in parts.netloc:
+        return proxy
+
+    host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    redacted = f"***:***@{host}" if host else "***:***"
+    return urlunsplit((parts.scheme, redacted, parts.path, parts.query, parts.fragment))
+
+
+def _log_startup_config(settings: Settings) -> None:
+    fee_max = settings.fee_max if settings.fee_max is not None else t(settings.lang, "common.unlimited")
+    date_after = settings.date_after or t(settings.lang, "common.unlimited")
+    creator_rules = len(settings.creator_rules)
+    creator_rules_source = settings.creator_rules_source or t(settings.lang, "common.not_configured")
+    ext_whitelist = ",".join(sorted(settings.ext_whitelist))
+
+    logger.info(t(settings.lang, "main.start"))
+    logger.info(t(settings.lang, "main.download_dir", path=settings.download_dir))
+    logger.info(t(settings.lang, "main.db", path=settings.db_path))
+    logger.info(t(settings.lang, "main.lang", lang=settings.lang))
+    logger.info(
+        t(
+            settings.lang,
+            "main.mode",
+            supporting=settings.mode_supporting,
+            following=settings.mode_following,
+        )
+    )
+    logger.info(
+        t(
+            settings.lang,
+            "main.network",
+            proxy=_redact_proxy(settings.proxy, settings.lang),
+            interval_sec=settings.interval_sec,
+            concurrency=settings.concurrency,
+        )
+    )
+    logger.info(
+        t(
+            settings.lang,
+            "main.filters",
+            ext_whitelist=ext_whitelist,
+            fee_min=settings.fee_min,
+            fee_max=fee_max,
+            date_after=date_after,
+        )
+    )
+    logger.info(
+        t(
+            settings.lang,
+            "main.run_retry",
+            first_run_max_posts=settings.first_run_max_posts,
+            post_403_retries=settings.post_403_retries,
+            post_403_backoff_base=settings.post_403_backoff_base,
+        )
+    )
+    logger.info(
+        t(
+            settings.lang,
+            "main.naming_notify",
+            name_rule=settings.name_rule,
+            notify_min_new=settings.notify_min_new,
+            bark_enabled=bool(settings.bark_device_key),
+            bark_server=settings.bark_server,
+        )
+    )
+    logger.info(
+        t(
+            settings.lang,
+            "main.creator_rules",
+            source=creator_rules_source,
+            rules=creator_rules,
+            default_skip=settings.default_creator_rule.skip,
+        )
+    )
+
+
 def _finalize_downloads(
     repo: Repo,
     stats: RunStats,
     futures: list[tuple[PostMeta, FileItem, Future[DownloadResult]]],
     post_states: dict[str, _PostDownloadState],
+    lang: str,
 ) -> None:
     """等待下载任务落定，写 downloaded，并只把完全成功的投稿标记 seen。"""
     for meta, item, fut in futures:
@@ -65,7 +160,7 @@ def _finalize_downloads(
                 state.failed = True
             stats.errors += 1
             stats.error_messages.append(f"{item.url}: {exc}")
-            logger.exception("下载任务抛异常: %s", item.url)
+            logger.exception(t(lang, "main.download_task_exception", url=item.url))
             continue
 
         if result.success and result.skipped_reason is None:
@@ -94,8 +189,12 @@ def _finalize_downloads(
         meta = state.meta
         if state.failed:
             logger.warning(
-                "投稿 %s/%s 存在下载失败，未标记 seen，留待下次 run 重试",
-                meta.creator_id, meta.post_id,
+                t(
+                    lang,
+                    "main.post_failed_not_seen",
+                    creator_id=meta.creator_id,
+                    post_id=meta.post_id,
+                )
             )
             continue
         repo.mark_seen(
@@ -122,7 +221,7 @@ def setup_logging(log_path: Optional[Path] = None, level: str = "INFO") -> None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
         except OSError as exc:
-            print(f"[warn] 无法写日志文件 {log_path}: {exc}", file=sys.stderr)
+            print(t(None, "main.log_file_failed", path=log_path, error=exc), file=sys.stderr)
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -159,18 +258,30 @@ def _collect_files_for_post(
                     300.0,
                 )
                 logger.warning(
-                    "post.info %s 返回 403，等待 %.0fs 后重试 (%d/%d)",
-                    meta.post_id, wait, attempt + 1, max_retries,
+                    t(
+                        settings.lang,
+                        "main.post_403_retry",
+                        post_id=meta.post_id,
+                        wait=wait,
+                        attempt=attempt + 1,
+                        max_retries=max_retries,
+                    )
                 )
                 time.sleep(wait)
                 continue
             logger.info(
-                "post.info %s 重试 %d 次后仍 403，跳过（可能是付费等级不足或限定内容）",
-                meta.post_id, max_retries,
+                t(
+                    settings.lang,
+                    "main.post_403_skip",
+                    post_id=meta.post_id,
+                    max_retries=max_retries,
+                )
             )
             return []
         except FanboxError as exc:
-            logger.warning("拉详情失败 %s: %s", meta.post_id, exc)
+            logger.warning(
+                t(settings.lang, "main.detail_fetch_failed", post_id=meta.post_id, error=exc)
+            )
             return None
 
     if detail is None:
@@ -178,7 +289,7 @@ def _collect_files_for_post(
 
     body = detail.get("body") if isinstance(detail, dict) else None
     if not isinstance(body, dict):
-        logger.warning("post.info %s 响应缺少有效 body，保留下次重试", meta.post_id)
+        logger.warning(t(settings.lang, "main.invalid_body", post_id=meta.post_id))
         return None
 
     files = parse_post(body)
@@ -190,13 +301,13 @@ def _post_streams(
 ) -> Iterator[PostMeta]:
     """根据开关串接 supporting + following。"""
     if settings.mode_supporting:
-        logger.info("=== 抓取赞助流 ===")
+        logger.info(t(settings.lang, "main.stream_supporting"))
         yield from iter_new_supporting(client, repo, settings)
     if settings.mode_following:
-        logger.info("=== 抓取关注流 ===")
+        logger.info(t(settings.lang, "main.stream_following"))
         yield from iter_new_following(client, repo, settings)
     if not settings.mode_supporting and not settings.mode_following:
-        logger.warning("两个模式都关了，本次无事可做")
+        logger.warning(t(settings.lang, "main.modes_disabled"))
 
 
 def run() -> int:
@@ -204,26 +315,20 @@ def run() -> int:
     settings = load_settings()
     setup_logging(settings.download_dir / "fanbox_monitor.log", settings.log_level)
 
-    logger.info("FanboxMonitor 启动")
-    logger.info("下载目录: %s", settings.download_dir)
-    logger.info("DB: %s", settings.db_path)
-    logger.info(
-        "模式: supporting=%s following=%s",
-        settings.mode_supporting,
-        settings.mode_following,
-    )
+    _log_startup_config(settings)
 
     settings.download_dir.mkdir(parents=True, exist_ok=True)
 
     conn = open_db(settings.db_path)
     repo = Repo(conn)
 
-    interval = CrawlInterval(settings.interval_sec)
+    interval = CrawlInterval(settings.interval_sec, settings.lang)
     client = FanboxClient(
         session_cookie=settings.session,
         user_agent=settings.user_agent,
         interval=interval,
         proxy=settings.proxy,
+        lang=settings.lang,
     )
 
     stats = RunStats(started_at=int(time.time()))
@@ -239,18 +344,16 @@ def run() -> int:
             quota_limit = settings.first_run_max_posts
             quota_used = 0
             if quota_limit > 0:
-                logger.info("本次 run 配额：最多处理 %d 条新投稿", quota_limit)
+                logger.info(t(settings.lang, "main.quota_limit", limit=quota_limit))
 
             for meta in _post_streams(client, repo, settings):
                 if meta.post_id in seen_this_run:
-                    logger.debug("投稿 %s 本次 run 已处理，跳过重复来源", meta.post_id)
+                    logger.debug(t(settings.lang, "main.duplicate_post", post_id=meta.post_id))
                     continue
                 seen_this_run.add(meta.post_id)
 
                 if quota_limit > 0 and quota_used >= quota_limit:
-                    logger.info(
-                        "达到本次 run 配额上限 %d，停止处理后续投稿", quota_limit
-                    )
+                    logger.info(t(settings.lang, "main.quota_reached", limit=quota_limit))
                     break
 
                 try:
@@ -258,7 +361,7 @@ def run() -> int:
                 except FanboxAuthError:
                     raise
                 except FanboxRateLimitError:
-                    logger.error("触发限流且重试失败，提前结束本次 run")
+                    logger.error(t(settings.lang, "main.rate_limit_stop"))
                     stats.errors += 1
                     stats.error_messages.append("rate_limit")
                     break
@@ -285,11 +388,15 @@ def run() -> int:
                 post_states[meta.post_id] = state
                 stats.new_posts += 1
                 logger.info(
-                    "投稿 %s/%s (%s) 共 %d 个文件",
-                    meta.creator_id,
-                    meta.post_id,
-                    meta.title,
-                    len(files),
+                    t(
+                        settings.lang,
+                        "main.post_files_found",
+                        creator_id=meta.creator_id,
+                        post_id=meta.post_id,
+                        title=meta.title,
+                        published_dt=meta.published_dt,
+                        count=len(files),
+                    )
                 )
 
                 # 记录 creator 信息（即便所有文件都已下载，也保留 creator 出现过的事实）
@@ -321,36 +428,38 @@ def run() -> int:
                         state.failed = True
                         stats.errors += 1
                         stats.error_messages.append(f"{item.url}: submit_failed: {exc}")
-                        logger.exception("提交下载任务失败: %s", item.url)
+                        logger.exception(t(settings.lang, "main.submit_download_failed", url=item.url))
                         continue
                     futures.append((meta, item, fut))
 
-            _finalize_downloads(repo, stats, futures, post_states)
+            _finalize_downloads(repo, stats, futures, post_states, settings.lang)
             downloads_finalized = True
 
     except FanboxAuthError as exc:
         if not downloads_finalized:
-            _finalize_downloads(repo, stats, futures, post_states)
+            _finalize_downloads(repo, stats, futures, post_states, settings.lang)
             downloads_finalized = True
         stats.errors += 1
         stats.error_messages.append(f"auth: {exc}")
-        logger.error("鉴权失败，cookie 可能已过期: %s", exc)
+        logger.error(t(settings.lang, "main.auth_failed", error=exc))
         send_qinglong(
-            "FanboxMonitor 认证失败", f"FANBOX_SESSION cookie 已失效\n{exc}"
+            t(settings.lang, "main.auth_notify_title"),
+            t(settings.lang, "main.auth_notify_body", error=exc),
+            settings.lang,
         )
         conn.close()
         return 2
     except Exception as exc:
         if not downloads_finalized:
-            _finalize_downloads(repo, stats, futures, post_states)
+            _finalize_downloads(repo, stats, futures, post_states, settings.lang)
             downloads_finalized = True
         stats.errors += 1
         stats.error_messages.append(f"unhandled: {exc}")
-        logger.exception("未处理异常: %s", exc)
+        logger.exception(t(settings.lang, "main.unhandled_exception", error=exc))
 
     stats.ended_at = int(time.time())
 
-    title, body = format_run_summary(stats)
+    title, body = format_run_summary(stats, settings.lang)
     repo.insert_run_log(
         stats.started_at,
         stats.ended_at,
@@ -361,7 +470,7 @@ def run() -> int:
     )
     conn.close()
 
-    logger.info("本次 run 结束:\n%s", body)
+    logger.info(t(settings.lang, "main.run_finished", body=body))
 
     push_run_results(settings, stats)
 

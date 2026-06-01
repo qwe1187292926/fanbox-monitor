@@ -16,6 +16,7 @@ from typing import Optional
 from curl_cffi import requests as curl_requests
 
 from config import Settings
+from i18n import t
 from models.types import DownloadResult, FileItem
 from parser.filename import render_filename
 
@@ -80,8 +81,13 @@ def download_file(
         if resume_pos > 0:
             headers["Range"] = f"bytes={resume_pos}-"
             logger.info(
-                "断点续传 %s（已有 %.2f MiB，attempt %d）",
-                relative, resume_pos / 1048576, attempt + 1,
+                t(
+                    settings.lang,
+                    "download.resume",
+                    relative=relative,
+                    mib=resume_pos / 1048576,
+                    attempt=attempt + 1,
+                )
             )
 
         try:
@@ -95,7 +101,13 @@ def download_file(
         except Exception as exc:
             last_error = f"net error: {exc}"
             logger.warning(
-                "下载 %s 失败 (attempt %d): %s", url, attempt + 1, exc,
+                t(
+                    settings.lang,
+                    "download.net_failed",
+                    url=url,
+                    attempt=attempt + 1,
+                    error=exc,
+                )
             )
             _backoff_sleep(attempt)
             continue
@@ -106,7 +118,7 @@ def download_file(
         if status in (403, 404):
             if item.retry_url and not used_retry_url:
                 logger.warning(
-                    "%s 返回 %d，降级到 retry_url", url, status,
+                    t(settings.lang, "download.retry_url", url=url, status=status)
                 )
                 url = item.retry_url
                 used_retry_url = True
@@ -123,7 +135,7 @@ def download_file(
 
         # 416 Range Not Satisfiable：本地 .part 比远程文件还大，从头来
         if status == 416:
-            logger.warning("%s 返回 416，重置 .part 重新下载", url)
+            logger.warning(t(settings.lang, "download.reset_part", url=url))
             if tmp.exists():
                 try:
                     tmp.unlink()
@@ -134,7 +146,15 @@ def download_file(
         # 5xx：退避重试（保留 .part 用于续传）
         if status >= 500:
             last_error = f"HTTP {status}"
-            logger.warning("%s 返回 %d (attempt %d)", url, status, attempt + 1)
+            logger.warning(
+                t(
+                    settings.lang,
+                    "download.server_status",
+                    url=url,
+                    status=status,
+                    attempt=attempt + 1,
+                )
+            )
             _backoff_sleep(attempt)
             continue
 
@@ -148,7 +168,7 @@ def download_file(
             file_mode = "ab"
         elif status == 200:
             if resume_pos > 0:
-                logger.info("服务器忽略 Range，从头下载 %s", url)
+                logger.info(t(settings.lang, "download.range_ignored", url=url))
             file_mode = "wb"
         else:
             return DownloadResult(
@@ -167,8 +187,13 @@ def download_file(
             now_size = _tmp_size(tmp)
             last_error = f"write error: {exc}"
             logger.warning(
-                "写入 %s 中断: %s (已下载 %.2f MiB，下次重试断点续传)",
-                target, exc, now_size / 1048576,
+                t(
+                    settings.lang,
+                    "download.write_interrupted",
+                    target=target,
+                    error=exc,
+                    mib=now_size / 1048576,
+                )
             )
             _backoff_sleep(attempt)
             continue
@@ -177,7 +202,14 @@ def download_file(
             size = target.stat().st_size
         except OSError:
             size = None
-        logger.info("下载完成: %s (%.2f MiB)", relative, (size or 0) / 1048576)
+        logger.info(
+            t(
+                settings.lang,
+                "download.completed",
+                relative=relative,
+                mib=(size or 0) / 1048576,
+            )
+        )
         return DownloadResult(
             item=item, success=True, local_path=str(target), size=size,
         )

@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 
 from config import Settings, get_rule_for
+from i18n import t
 from models.types import PostMeta
 from parser.filter import accept_post
 from storage.repo import Repo
@@ -30,5 +31,13 @@ def filter_and_mark(meta: PostMeta, repo: Repo, settings: Settings) -> bool:
     repo.mark_seen(
         meta.post_id, meta.creator_id, meta.published_dt, meta.fee, meta.title
     )
-    logger.debug("过滤跳过 %s/%s: %s", meta.creator_id, meta.post_id, reason)
+    logger.debug(
+        t(
+            settings.lang,
+            "crawler.filter_skip",
+            creator_id=meta.creator_id,
+            post_id=meta.post_id,
+            reason=reason,
+        )
+    )
     return False

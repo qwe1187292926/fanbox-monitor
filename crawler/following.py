@@ -14,6 +14,7 @@ from api.client import FanboxClient
 from api.endpoints import list_creator_posts, list_following
 from config import Settings, get_rule_for
 from crawler.incremental import filter_and_mark
+from i18n import t
 from models.types import PostMeta
 from parser.post_parser import extract_post_meta
 from storage.repo import Repo
@@ -32,7 +33,9 @@ def _iter_creator_posts(
     try:
         page = list_creator_posts(client, creator_id, limit=300)
     except Exception as exc:
-        logger.warning("creator %s 首页拉取失败: %s", creator_id, exc)
+        logger.warning(
+            t(settings.lang, "crawler.creator_home_failed", creator_id=creator_id, error=exc)
+        )
         raise
 
     while True:
@@ -77,7 +80,15 @@ def _iter_creator_posts(
         try:
             page = client.get(next_url)
         except Exception as exc:
-            logger.warning("creator %s 翻页失败 %s: %s", creator_id, next_url, exc)
+            logger.warning(
+                t(
+                    settings.lang,
+                    "crawler.creator_page_failed",
+                    creator_id=creator_id,
+                    url=next_url,
+                    error=exc,
+                )
+            )
             raise
 
     if new_max_dt:
@@ -94,11 +105,11 @@ def iter_new_following(
     try:
         raw = list_following(client)
     except Exception as exc:
-        logger.error("creator.listFollowing 失败: %s", exc)
+        logger.error(t(settings.lang, "crawler.following_failed", error=exc))
         raise
 
     creators = (raw.get("body") or {}).get("creators") or []
-    logger.info("following 拉到 %d 个关注的创作者", len(creators))
+    logger.info(t(settings.lang, "crawler.following_count", count=len(creators)))
 
     for creator in creators:
         creator_id = str(creator.get("creatorId") or "")
@@ -106,9 +117,16 @@ def iter_new_following(
             continue
         rule = get_rule_for(settings, creator_id)
         if rule.skip:
-            logger.info("creator %s 在规则里设为 skip，跳过", creator_id)
+            logger.info(t(settings.lang, "crawler.creator_skip", creator_id=creator_id))
             continue
 
         creator_name = ((creator.get("user") or {}).get("name")) or creator_id
-        logger.info("处理 creator: %s (%s)", creator_name, creator_id)
+        logger.info(
+            t(
+                settings.lang,
+                "crawler.creator_process",
+                name=creator_name,
+                creator_id=creator_id,
+            )
+        )
         yield from _iter_creator_posts(client, repo, settings, creator_id)

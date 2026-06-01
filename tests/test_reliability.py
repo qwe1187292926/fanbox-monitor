@@ -9,6 +9,7 @@ from api.exceptions import FanboxAPIError
 from config import Settings, load_settings
 from crawler.supporting import iter_new_supporting
 from models.types import CreatorRule, DownloadResult, FileItem, PostMeta
+from notify.push import format_run_summary
 from storage.db import SCHEMA
 from storage.repo import Repo
 
@@ -189,12 +190,41 @@ class ReliabilityTests(unittest.TestCase):
             "FANBOX_SESSION": "session",
             "FANBOX_LOG_LEVEL": "debug",
             "FANBOX_CONCURRENCY": "0",
+            "FANBOX_LANG": "en",
         }
         with patch.dict("os.environ", env, clear=True):
             settings = load_settings(Path("."))
 
         self.assertEqual(settings.log_level, "DEBUG")
         self.assertEqual(settings.concurrency, 1)
+        self.assertEqual(settings.lang, "en-US")
+
+    def test_proxy_redaction_hides_credentials(self):
+        self.assertEqual(main._redact_proxy(None), "未配置")
+        self.assertEqual(
+            main._redact_proxy("http://user:pass@proxy.example:8080"),
+            "http://***:***@proxy.example:8080",
+        )
+        self.assertEqual(
+            main._redact_proxy("socks5://proxy.example:1080"),
+            "socks5://proxy.example:1080",
+        )
+
+    def test_format_run_summary_uses_requested_language(self):
+        stats = main.RunStats(
+            started_at=100,
+            ended_at=105,
+            new_posts=2,
+            new_files=3,
+            skipped_files=1,
+            errors=0,
+        )
+
+        title, body = format_run_summary(stats, "en-US")
+
+        self.assertEqual(title, "Fanbox new posts 2 / files 3")
+        self.assertIn("New files: 3", body)
+        self.assertIn("Duration: 5s", body)
 
     def test_extract_post_id_accepts_common_inputs(self):
         self.assertEqual(download_post.extract_post_id("123456"), "123456")

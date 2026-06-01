@@ -17,6 +17,7 @@ from api.exceptions import (
     FanboxRateLimitError,
 )
 from crawler.interval import CrawlInterval
+from i18n import t
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +34,14 @@ class FanboxClient:
         interval: CrawlInterval,
         proxy: Optional[str] = None,
         timeout: int = DEFAULT_TIMEOUT,
+        lang: str = "zh-CN",
     ) -> None:
         if not session_cookie:
-            raise FanboxAuthError("session_cookie 为空")
+            raise FanboxAuthError(t(lang, "api.session_cookie_empty"))
 
         self.interval = interval
         self.timeout = timeout
+        self.lang = lang
 
         self.session = curl_requests.Session()
         if proxy:
@@ -75,7 +78,9 @@ class FanboxClient:
             )
         except Exception as exc:  # 网络/超时
             self.interval.bump("long")
-            raise FanboxAPIError(f"请求失败: {url} - {exc}") from exc
+            raise FanboxAPIError(
+                t(self.lang, "api.request_failed", url=url, error=exc)
+            ) from exc
 
         status = resp.status_code
 
@@ -85,31 +90,33 @@ class FanboxClient:
 
         if status == 401:
             raise FanboxAuthError(
-                f"401 认证失败：FANBOX_SESSION cookie 已失效。URL: {url}"
+                t(self.lang, "api.auth_failed_401", url=url)
             )
 
         if status == 403:
             # fanbox 对单条资源的 403 通常是"付费等级不足/限定内容"，
             # 不代表 cookie 失效。调用方应跳过这条继续。
             raise FanboxForbiddenError(
-                f"403 无权访问该资源（可能是付费等级不足或限定内容）: {url}"
+                t(self.lang, "api.forbidden_403", url=url)
             )
 
         if status >= 500:
             self.interval.bump("long")
-            raise FanboxAPIError(f"{status} 服务端错误: {url}")
+            raise FanboxAPIError(t(self.lang, "api.server_error", status=status, url=url))
 
         if status >= 400:
-            raise FanboxAPIError(f"{status} 客户端错误: {url}")
+            raise FanboxAPIError(t(self.lang, "api.client_error", status=status, url=url))
 
         try:
             data = resp.json()
         except (json.JSONDecodeError, ValueError) as exc:
-            raise FanboxAPIError(f"响应不是合法 JSON: {url}") from exc
+            raise FanboxAPIError(t(self.lang, "api.invalid_json", url=url)) from exc
 
         # fanbox 也可能在 200 里返回 {"error": "..."}
         if isinstance(data, dict) and "error" in data and "body" not in data:
-            raise FanboxAPIError(f"业务错误 {url}: {data.get('error')}")
+            raise FanboxAPIError(
+                t(self.lang, "api.business_error", url=url, error=data.get("error"))
+            )
 
         self.interval.bump("short")
         return data

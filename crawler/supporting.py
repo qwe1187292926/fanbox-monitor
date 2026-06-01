@@ -13,6 +13,7 @@ from api.client import FanboxClient
 from api.endpoints import list_supporting_posts
 from config import Settings
 from crawler.incremental import filter_and_mark
+from i18n import t
 from models.types import PostMeta
 from parser.post_parser import extract_post_meta
 from storage.repo import Repo
@@ -37,7 +38,7 @@ def iter_new_supporting(
     try:
         page = list_supporting_posts(client, limit=300)
     except Exception as exc:
-        logger.error("supporting 首页拉取失败: %s", exc)
+        logger.error(t(settings.lang, "crawler.supporting_home_failed", error=exc))
         raise
 
     while True:
@@ -68,7 +69,7 @@ def iter_new_supporting(
             yield meta
 
         if page_all_seen:
-            logger.info("supporting 当前页全部已见，停止翻页")
+            logger.info(t(settings.lang, "crawler.supporting_all_seen"))
             break
         if not next_url:
             break
@@ -76,7 +77,9 @@ def iter_new_supporting(
         try:
             page = client.get(next_url)
         except Exception as exc:
-            logger.warning("supporting 翻页失败 %s: %s", next_url, exc)
+            logger.warning(
+                t(settings.lang, "crawler.supporting_page_failed", url=next_url, error=exc)
+            )
             raise
 
     if new_max_dt:

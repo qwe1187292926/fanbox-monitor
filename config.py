@@ -9,6 +9,7 @@ from typing import Optional
 
 import yaml
 
+from i18n import SUPPORTED_LANGS, is_supported_lang, normalize_lang, t
 from models.types import CreatorRule
 
 
@@ -62,6 +63,7 @@ class Settings:
     bark_sound: str
 
     # per-creator
+    lang: str = "zh-CN"
     creator_rules_source: Optional[str] = None
     default_creator_rule: CreatorRule = field(default_factory=CreatorRule)
     creator_rules: dict[str, CreatorRule] = field(default_factory=dict)
@@ -126,8 +128,19 @@ def _env_log_level(name: str, default: str = "INFO") -> str:
     raw = (os.environ.get(name) or default).strip().upper()
     allowed = {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}
     if raw not in allowed:
-        raise ValueError(f"{name} 必须是以下之一: {', '.join(sorted(allowed))}")
+        raise ValueError(
+            t(None, "config.invalid_log_level", name=name, allowed=", ".join(sorted(allowed)))
+        )
     return raw
+
+
+def _env_lang(name: str, default: str = "zh-CN") -> str:
+    raw = (os.environ.get(name) or default).strip()
+    if not is_supported_lang(raw):
+        raise ValueError(
+            t(None, "config.invalid_lang", name=name, allowed=", ".join(SUPPORTED_LANGS))
+        )
+    return normalize_lang(raw)
 
 
 def _parse_rule(data: dict) -> CreatorRule:
@@ -177,9 +190,7 @@ def load_settings(project_root: Optional[Path] = None) -> Settings:
 
     session = os.environ.get("FANBOX_SESSION", "").strip()
     if not session:
-        raise RuntimeError(
-            "FANBOX_SESSION 未设置：请在环境变量或 .env 里填入 fanbox 的 FANBOXSESSID cookie 值"
-        )
+        raise RuntimeError(t(_env_lang("FANBOX_LANG"), "config.session_missing"))
 
     user_agent = os.environ.get("FANBOX_USER_AGENT", "").strip() or (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -235,6 +246,7 @@ def load_settings(project_root: Optional[Path] = None) -> Settings:
         bark_device_key=(os.environ.get("FANBOX_BARK_DEVICE_KEY") or "").strip(),
         bark_group=(os.environ.get("FANBOX_BARK_GROUP") or "FanboxMonitor").strip(),
         bark_sound=(os.environ.get("FANBOX_BARK_SOUND") or "").strip(),
+        lang=_env_lang("FANBOX_LANG"),
         creator_rules_source=creator_rules_source,
         default_creator_rule=default_rule,
         creator_rules=creator_rules,

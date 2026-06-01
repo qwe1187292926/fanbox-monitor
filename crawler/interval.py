@@ -11,13 +11,16 @@ import random
 import time
 from typing import Literal
 
+from i18n import t
+
 logger = logging.getLogger(__name__)
 
 
 class CrawlInterval:
-    def __init__(self, interval_sec: float) -> None:
+    def __init__(self, interval_sec: float, lang: str = "zh-CN") -> None:
         self.interval_sec = max(0.0, interval_sec)
         self._next_allowed_ts: float = 0.0
+        self.lang = lang
 
     def wait(self) -> None:
         now = time.monotonic()
@@ -33,7 +36,7 @@ class CrawlInterval:
         else:
             delta = random.uniform(300.0, 360.0)
             logger.warning(
-                "触发 fanbox 限流，等待 %.0f 秒后重试", delta
+                t(self.lang, "interval.rate_limited_wait", seconds=delta)
             )
         self._next_allowed_ts = now + delta
 
