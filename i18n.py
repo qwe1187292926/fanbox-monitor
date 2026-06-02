@@ -251,6 +251,7 @@ MESSAGES: dict[str, dict[str, str]] = {
         "main.run_retry": "Run limits/retries: first_run_max_posts={first_run_max_posts} post_403_retries={post_403_retries} post_403_backoff_base={post_403_backoff_base:.2f}",
         "main.naming_notify": "Naming/notify: name_rule={name_rule} notify_min_new={notify_min_new} bark_enabled={bark_enabled} bark_server={bark_server}",
         "main.creator_rules": "Creator rules: source={source} rules={rules} default_skip={default_skip}",
+        "main.lock_already_running": "Another FanboxMonitor run is already active; skipping this schedule (lock TTL {ttl}s)",
         "main.download_task_exception": "Download task raised an exception: {url}",
         "main.post_failed_not_seen": "Post {creator_id}/{post_id} has failed downloads. It was not marked seen and will be retried next run",
         "main.log_file_failed": "[warn] Cannot write log file {path}: {error}",
@@ -294,9 +295,11 @@ MESSAGES: dict[str, dict[str, str]] = {
         "notify.bark_count": "Bark push: one notification for each of {count} creators (group={group})",
         "crawler.supporting_home_failed": "Failed to fetch supporting home: {error}",
         "crawler.supporting_all_seen": "All posts on current supporting page are already seen. Stopping pagination",
+        "crawler.supporting_cursor_reached": "Reached the previous supporting cursor. Stopping pagination",
         "crawler.supporting_page_failed": "Failed to fetch supporting page {url}: {error}",
         "crawler.creator_home_failed": "Failed to fetch creator {creator_id} home: {error}",
         "crawler.creator_page_failed": "Failed to fetch creator {creator_id} page {url}: {error}",
+        "crawler.creator_cursor_reached": "Reached the previous cursor for creator {creator_id}. Stopping pagination",
         "crawler.following_failed": "creator.listFollowing failed: {error}",
         "crawler.following_count": "Fetched {count} followed creators",
         "crawler.creator_skip": "creator {creator_id} is set to skip in rules; skipping",
@@ -356,6 +359,8 @@ def env_lang(name: str = "FANBOX_LANG") -> str:
 def t(locale: str | None, key: str, **kwargs: Any) -> str:
     locale = normalize_lang(locale)
     template = MESSAGES.get(locale, {}).get(key)
+    if template is None and locale != "en-US":
+        template = MESSAGES["en-US"].get(key)
     if template is None:
         template = MESSAGES["zh-CN"].get(key, key)
     if not kwargs:

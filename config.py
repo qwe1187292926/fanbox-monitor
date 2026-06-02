@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -55,6 +56,7 @@ class Settings:
     first_run_max_posts: int
     post_403_retries: int
     post_403_backoff_base: float
+    run_lock_ttl_sec: int
 
     # Bark 通知（可选）。设了 device_key 就额外走 Bark per-creator 通知（带头像）。
     bark_server: str
@@ -221,6 +223,7 @@ def load_settings(project_root: Optional[Path] = None) -> Settings:
     post_403_backoff_base = max(
         0.0, _env_float("FANBOX_POST_403_BACKOFF_BASE", 30.0)
     )
+    run_lock_ttl_sec = max(60, _env_int("FANBOX_RUN_LOCK_TTL_SEC", 21600))
 
     return Settings(
         session=session,
@@ -242,6 +245,7 @@ def load_settings(project_root: Optional[Path] = None) -> Settings:
         first_run_max_posts=first_run_max_posts,
         post_403_retries=post_403_retries,
         post_403_backoff_base=post_403_backoff_base,
+        run_lock_ttl_sec=run_lock_ttl_sec,
         bark_server=(os.environ.get("FANBOX_BARK_SERVER") or "https://api.day.app").rstrip("/"),
         bark_device_key=(os.environ.get("FANBOX_BARK_DEVICE_KEY") or "").strip(),
         bark_group=(os.environ.get("FANBOX_BARK_GROUP") or "FanboxMonitor").strip(),
@@ -266,3 +270,37 @@ def get_rule_for(settings: Settings, creator_id: str) -> CreatorRule:
         tags_include=specific.tags_include or base.tags_include,
         tags_exclude=specific.tags_exclude or base.tags_exclude,
     )
+
+
+def filter_revision(settings: Settings) -> str:
+    """Return a stable key for rules that decide whether a post is skipped.
+
+    Cursors and skipped rows are scoped by this value. If the user changes
+    global filters, extension filters, or per-creator rules, the old cursor is
+    ignored and previously skipped posts are evaluated again.
+    """
+    payload = {
+        "fee_min": settings.fee_min,
+        "fee_max": settings.fee_max,
+        "date_after": settings.date_after,
+        "ext_whitelist": sorted(settings.ext_whitelist),
+        "default_rule": {
+            "skip": settings.default_creator_rule.skip,
+            "fee_min": settings.default_creator_rule.fee_min,
+            "fee_max": settings.default_creator_rule.fee_max,
+            "tags_include": settings.default_creator_rule.tags_include,
+            "tags_exclude": settings.default_creator_rule.tags_exclude,
+        },
+        "creator_rules": {
+            creator_id: {
+                "skip": rule.skip,
+                "fee_min": rule.fee_min,
+                "fee_max": rule.fee_max,
+                "tags_include": rule.tags_include,
+                "tags_exclude": rule.tags_exclude,
+            }
+            for creator_id, rule in sorted(settings.creator_rules.items())
+        },
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]

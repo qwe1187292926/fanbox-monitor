@@ -2,7 +2,7 @@
 
 移植自 src/ts/InitHomePage.ts:110-141 + InitPageBase.ts:108-131。
 不再使用原项目的 paginateCreator 优化（那是冷启动建库用的），
-直接用 listCreator + nextUrl 翻页，靠 seen_posts 去重；cursor 仅记录最近扫描 checkpoint。
+直接用 listCreator + nextUrl 翻页，靠当前过滤规则版本的 cursor 控制增量边界。
 本流自身不限量，整次 run 的全局配额由 main.py 管理。
 """
 from __future__ import annotations
@@ -12,7 +12,7 @@ from typing import Iterator, Optional
 
 from api.client import FanboxClient
 from api.endpoints import list_creator_posts, list_following
-from config import Settings, get_rule_for
+from config import Settings, filter_revision, get_rule_for
 from crawler.incremental import filter_and_mark
 from i18n import t
 from models.types import PostMeta
@@ -22,13 +22,27 @@ from storage.repo import Repo
 logger = logging.getLogger(__name__)
 
 
+def _cursor_reached(meta: PostMeta, cursor_dt: Optional[str], cursor_id: Optional[str]) -> bool:
+    if not cursor_dt:
+        return False
+    if meta.published_dt < cursor_dt:
+        return True
+    if meta.published_dt == cursor_dt and (not cursor_id or meta.post_id == cursor_id):
+        return True
+    return False
+
+
 def _iter_creator_posts(
     client: FanboxClient, repo: Repo, settings: Settings, creator_id: str
 ) -> Iterator[PostMeta]:
-    scope = f"following:{creator_id}"
+    revision = filter_revision(settings)
+    scope = f"following:{creator_id}:{revision}"
+    cursor_dt, cursor_id = repo.get_cursor(scope)
 
     new_max_dt: Optional[str] = None
     new_max_id: Optional[str] = None
+    completed_scan = False
+    saw_cursor_advance = cursor_dt is None
 
     try:
         page = list_creator_posts(client, creator_id, limit=300)
@@ -62,7 +76,18 @@ def _iter_creator_posts(
                 new_max_dt = meta.published_dt
                 new_max_id = meta.post_id
 
+            if _cursor_reached(meta, cursor_dt, cursor_id):
+                completed_scan = True
+                logger.info(
+                    t(settings.lang, "crawler.creator_cursor_reached", creator_id=creator_id)
+                )
+                break
+            if cursor_dt and meta.published_dt >= cursor_dt:
+                saw_cursor_advance = True
+
             if repo.is_seen(meta.post_id):
+                continue
+            if repo.is_skipped(meta.post_id, revision):
                 continue
 
             page_all_seen = False
@@ -72,9 +97,10 @@ def _iter_creator_posts(
 
             yield meta
 
-        if page_all_seen:
+        if completed_scan:
             break
         if not next_url:
+            completed_scan = True
             break
 
         try:
@@ -91,7 +117,7 @@ def _iter_creator_posts(
             )
             raise
 
-    if new_max_dt:
+    if completed_scan and new_max_dt and saw_cursor_advance:
         repo.set_cursor(scope, new_max_dt, new_max_id)
 
 

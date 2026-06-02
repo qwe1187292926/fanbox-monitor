@@ -11,9 +11,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
+import socket
 import sys
 import time
+import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,7 +31,8 @@ from api.exceptions import (
     FanboxForbiddenError,
     FanboxRateLimitError,
 )
-from config import Settings, load_settings
+from config import Settings, filter_revision, load_settings
+from crawler.incremental import filter_and_mark
 from crawler.following import iter_new_following
 from crawler.interval import CrawlInterval
 from crawler.supporting import iter_new_supporting
@@ -300,6 +304,11 @@ def _post_streams(
     client: FanboxClient, repo: Repo, settings: Settings
 ) -> Iterator[PostMeta]:
     """根据开关串接 supporting + following。"""
+    revision = filter_revision(settings)
+    for meta in repo.iter_skipped_for_recheck(revision):
+        if filter_and_mark(meta, repo, settings):
+            yield meta
+
     if settings.mode_supporting:
         logger.info(t(settings.lang, "main.stream_supporting"))
         yield from iter_new_supporting(client, repo, settings)
@@ -321,15 +330,28 @@ def run() -> int:
 
     conn = open_db(settings.db_path)
     repo = Repo(conn)
+    lock_owner = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+    lock_name = "fanbox_monitor"
+    if not repo.acquire_run_lock(lock_name, lock_owner, settings.run_lock_ttl_sec):
+        logger.warning(
+            t(settings.lang, "main.lock_already_running", ttl=settings.run_lock_ttl_sec)
+        )
+        conn.close()
+        return 0
 
-    interval = CrawlInterval(settings.interval_sec, settings.lang)
-    client = FanboxClient(
-        session_cookie=settings.session,
-        user_agent=settings.user_agent,
-        interval=interval,
-        proxy=settings.proxy,
-        lang=settings.lang,
-    )
+    try:
+        interval = CrawlInterval(settings.interval_sec, settings.lang)
+        client = FanboxClient(
+            session_cookie=settings.session,
+            user_agent=settings.user_agent,
+            interval=interval,
+            proxy=settings.proxy,
+            lang=settings.lang,
+        )
+    except Exception:
+        repo.release_run_lock(lock_name, lock_owner)
+        conn.close()
+        raise
 
     stats = RunStats(started_at=int(time.time()))
     futures: list[tuple[PostMeta, FileItem, Future[DownloadResult]]] = []
@@ -374,13 +396,19 @@ def run() -> int:
                 quota_used += 1
 
                 if not files:
-                    # 没有可下载文件也视为已处理：mark_seen 避免下次重跑
-                    repo.mark_seen(
+                    # 当前过滤规则下没有可下载文件，记录为 skipped 以便规则变化后重评估。
+                    repo.mark_skipped(
                         meta.post_id,
+                        filter_revision(settings),
                         meta.creator_id,
                         meta.published_dt,
                         meta.fee,
                         meta.title,
+                        "no_accepted_files",
+                        updated_dt=meta.updated_dt,
+                        user_name=meta.user_name,
+                        user_icon_url=meta.user_icon_url,
+                        tags=meta.tags,
                     )
                     continue
 
@@ -442,12 +470,15 @@ def run() -> int:
         stats.errors += 1
         stats.error_messages.append(f"auth: {exc}")
         logger.error(t(settings.lang, "main.auth_failed", error=exc))
-        send_qinglong(
-            t(settings.lang, "main.auth_notify_title"),
-            t(settings.lang, "main.auth_notify_body", error=exc),
-            settings.lang,
-        )
-        conn.close()
+        try:
+            send_qinglong(
+                t(settings.lang, "main.auth_notify_title"),
+                t(settings.lang, "main.auth_notify_body", error=exc),
+                settings.lang,
+            )
+        finally:
+            repo.release_run_lock(lock_name, lock_owner)
+            conn.close()
         return 2
     except Exception as exc:
         if not downloads_finalized:
@@ -459,21 +490,23 @@ def run() -> int:
 
     stats.ended_at = int(time.time())
 
-    title, body = format_run_summary(stats, settings.lang)
-    repo.insert_run_log(
-        stats.started_at,
-        stats.ended_at,
-        stats.new_posts,
-        stats.new_files,
-        stats.errors,
-        body,
-    )
-    conn.close()
+    try:
+        title, body = format_run_summary(stats, settings.lang)
+        repo.insert_run_log(
+            stats.started_at,
+            stats.ended_at,
+            stats.new_posts,
+            stats.new_files,
+            stats.errors,
+            body,
+        )
 
-    logger.info(t(settings.lang, "main.run_finished", body=body))
+        logger.info(t(settings.lang, "main.run_finished", body=body))
 
-    push_run_results(settings, stats)
-
+        push_run_results(settings, stats)
+    finally:
+        repo.release_run_lock(lock_name, lock_owner)
+        conn.close()
     return 0 if stats.errors == 0 else 1
 
 

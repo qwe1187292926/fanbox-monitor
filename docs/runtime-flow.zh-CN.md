@@ -6,24 +6,28 @@
 
 1. 加载配置：从环境变量和 `.env` 读取 `Settings`，包括 Fanbox cookie、下载目录、数据库路径、抓取模式、限速、并发、过滤规则和通知配置。
 2. 初始化运行环境：设置日志，创建下载目录，打开 SQLite 数据库并确保表结构存在。
-3. 创建 Fanbox API 客户端：使用 `FANBOX_SESSION`、User-Agent、代理和请求间隔访问 Fanbox API。
-4. 选择抓取来源：
+3. 获取运行锁：使用 `run_lock` 防止多个 cron 实例重叠执行；过期锁会按 `FANBOX_RUN_LOCK_TTL_SEC` 自动清理。
+4. 创建 Fanbox API 客户端：使用 `FANBOX_SESSION`、User-Agent、代理和请求间隔访问 Fanbox API。
+5. 选择抓取来源：
    - `FANBOX_MODE_SUPPORTING=1` 时抓取赞助流。
    - `FANBOX_MODE_FOLLOWING=1` 时抓取关注流。
-5. 遍历新投稿：
+6. 遍历新投稿：
    - 已在 `seen_posts` 中的投稿直接跳过。
+   - 当前过滤规则版本下已在 `skipped_posts` 中的投稿直接跳过。
+   - 旧过滤规则版本下跳过、但当前版本尚未评估的投稿会先被重新评估。
    - 对未见投稿先做价格、日期、tag、creator 规则过滤。
-   - 过滤不通过的投稿会写入 `seen_posts`，避免下次重复评估。
-6. 拉取投稿详情：对通过早期过滤的投稿调用 `post.info`。
-7. 解析文件：把投稿详情解析成可下载的 `FileItem`，并按扩展名白名单过滤。
-8. 提交下载：未在 `downloaded` 中登记的文件会进入线程池下载。
-9. 收尾下载结果：
+   - 过滤不通过的投稿会写入 `skipped_posts`，同一过滤规则版本下不会重复评估；规则变化后会重新评估。
+   - supporting / following 会使用按过滤规则版本隔离的 `cursor` 停止翻页。
+7. 拉取投稿详情：对通过早期过滤的投稿调用 `post.info`。
+8. 解析文件：把投稿详情解析成可下载的 `FileItem`，并按扩展名白名单过滤。
+9. 提交下载：未在 `downloaded` 中登记的文件会进入线程池下载。
+10. 收尾下载结果：
    - 成功下载或磁盘已有文件会写入 `downloaded`。
    - 投稿内所有待下载文件都成功、已存在或已登记时，才写入 `seen_posts`。
    - 只要投稿内有文件失败，该投稿不会写入 `seen_posts`，留待下次运行重试。
-10. 写运行日志：把本次新增投稿数、新增文件数、错误数和摘要写入 `run_log`。
-11. 发送通知：达到通知阈值或出现错误时，发送青龙 notify / Bark 通知。
-12. 返回退出码：
+11. 写运行日志：把本次新增投稿数、新增文件数、错误数和摘要写入 `run_log`。
+12. 发送通知并释放运行锁：达到通知阈值或出现错误时，发送青龙 notify / Bark 通知；无论通知是否异常都会释放 `run_lock`。
+13. 返回退出码：
     - `0`：无错误。
     - `1`：有普通错误。
     - `2`：Fanbox cookie 认证失败。
@@ -33,10 +37,10 @@
 | 情况 | 处理方式 | 是否写入 `seen_posts` | 下次是否重试 |
 | --- | --- | --- | --- |
 | 投稿已经在 `seen_posts` | 直接跳过 | 已经存在 | 否 |
-| 价格、日期、tag、creator 规则过滤不通过 | 跳过并记录为已处理 | 是 | 否 |
-| `post.info` 返回 403 且重试后仍失败 | 认为无权限或限定内容，跳过 | 是 | 否 |
+| 价格、日期、tag、creator 规则过滤不通过 | 写入当前规则版本的 `skipped_posts` | 否 | 规则变化后重评估 |
+| `post.info` 返回 403 且重试后仍失败 | 当前规则版本下写入 `skipped_posts` | 否 | 规则变化后重评估 |
 | `post.info` 网络错误、5xx、JSON 错误等临时失败 | 记录错误，保留投稿 | 否 | 是 |
-| 投稿没有可下载文件 | 视为已处理 | 是 | 否 |
+| 投稿没有可下载文件 | 当前规则版本下写入 `skipped_posts` | 否 | 规则变化后重评估 |
 | 文件 URL 已在 `downloaded` | 跳过该文件 | 取决于投稿整体结果 | 否 |
 | 目标文件已存在但 DB 未登记 | 补写 `downloaded` | 取决于投稿整体结果 | 否 |
 | 文件下载成功 | 写入 `downloaded` | 若投稿内所有文件均成功则是 | 否 |
@@ -87,7 +91,7 @@ python download_post.py 123456
 
 ### `seen_posts`
 
-记录已经处理完成或明确跳过的投稿。进入此表的投稿，下次运行不会再次处理。
+记录已经处理完成的投稿。进入此表的投稿，下次运行不会再次处理。
 
 | 字段 | 类型 | 约束 | 含义 |
 | --- | --- | --- | --- |
@@ -122,16 +126,52 @@ python download_post.py 123456
 | --- | --- | --- |
 | `idx_dl_post` | `post_id` | 按投稿查询已下载文件 |
 
-### `cursor`
+### `skipped_posts`
 
-记录每个抓取范围最近扫描到的 checkpoint。目前主要用于观测和后续扩展，实际增量去重以 `seen_posts` 为主。
+记录在某个过滤规则版本下被跳过的投稿。过滤规则版本由全局过滤、扩展名白名单和 per-creator 规则生成；规则变化后，旧版本的跳过记录会被重新评估。
 
 | 字段 | 类型 | 约束 | 含义 |
 | --- | --- | --- | --- |
-| `scope` | `TEXT` | `PRIMARY KEY` | 抓取范围，例如 `supporting` 或 `following:{creator_id}` |
+| `post_id` | `TEXT` | `PRIMARY KEY` 的一部分 | Fanbox 投稿 ID |
+| `filter_revision` | `TEXT` | `PRIMARY KEY` 的一部分 | 当前过滤规则版本 |
+| `creator_id` | `TEXT` | `NOT NULL` | 创作者 ID |
+| `published_dt` | `TEXT` | `NOT NULL` | 投稿发布时间 |
+| `updated_dt` | `TEXT` | `NOT NULL DEFAULT ''` | 投稿更新时间 |
+| `fee` | `INTEGER` | `NOT NULL` | 投稿所需费用 |
+| `title` | `TEXT` | 可空 | 投稿标题 |
+| `user_name` | `TEXT` | `NOT NULL DEFAULT ''` | 创作者名称 |
+| `user_icon_url` | `TEXT` | `NOT NULL DEFAULT ''` | 创作者头像 URL |
+| `tags` | `TEXT` | `NOT NULL DEFAULT '[]'` | JSON 编码的标签列表 |
+| `reason` | `TEXT` | 可空 | 跳过原因 |
+| `skipped_at` | `INTEGER` | `NOT NULL` | 跳过时的 Unix 时间戳 |
+
+索引：
+
+| 索引 | 字段 | 用途 |
+| --- | --- | --- |
+| `idx_skipped_revision_dt` | `filter_revision, published_dt DESC` | 按过滤规则版本查询跳过投稿 |
+
+### `cursor`
+
+记录每个抓取范围最近扫描到的 checkpoint。`scope` 会带上过滤规则版本，避免规则变化后旧 cursor 阻止旧投稿重新评估。
+
+| 字段 | 类型 | 约束 | 含义 |
+| --- | --- | --- | --- |
+| `scope` | `TEXT` | `PRIMARY KEY` | 抓取范围，例如 `supporting:{filter_revision}` 或 `following:{creator_id}:{filter_revision}` |
 | `max_published_dt` | `TEXT` | 可空 | 最近扫描到的最大发布时间 |
 | `max_id` | `TEXT` | 可空 | 最近扫描到的投稿 ID |
 | `updated_at` | `INTEGER` | `NOT NULL` | cursor 更新时间戳 |
+
+### `run_lock`
+
+记录当前正在执行的定时任务，防止 cron 重叠运行。过期锁会在下一次获取锁时自动清理。
+
+| 字段 | 类型 | 约束 | 含义 |
+| --- | --- | --- | --- |
+| `name` | `TEXT` | `PRIMARY KEY` | 锁名称，目前为 `fanbox_monitor` |
+| `owner` | `TEXT` | `NOT NULL` | 当前运行实例标识 |
+| `acquired_at` | `INTEGER` | `NOT NULL` | 获取锁的 Unix 时间戳 |
+| `expires_at` | `INTEGER` | `NOT NULL` | 锁过期的 Unix 时间戳 |
 
 ### `run_log`
 

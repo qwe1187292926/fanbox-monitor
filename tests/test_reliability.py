@@ -6,7 +6,8 @@ from unittest.mock import patch
 import download_post
 import main
 from api.exceptions import FanboxAPIError
-from config import Settings, load_settings
+from config import Settings, filter_revision, load_settings
+from crawler.incremental import filter_and_mark
 from crawler.supporting import iter_new_supporting
 from models.types import CreatorRule, DownloadResult, FileItem, PostMeta
 from notify.push import format_run_summary
@@ -52,6 +53,7 @@ def _settings(root: Path) -> Settings:
         first_run_max_posts=50,
         post_403_retries=0,
         post_403_backoff_base=0.0,
+        run_lock_ttl_sec=3600,
         bark_server="https://api.day.app",
         bark_device_key="",
         bark_group="FanboxMonitor",
@@ -91,9 +93,33 @@ def _item(post_id: str = "post1") -> FileItem:
     )
 
 
+def _raw_post(post_id: str, published_dt: str, fee: int = 0) -> dict:
+    return {
+        "id": post_id,
+        "creatorId": "creator1",
+        "user": {"name": "Creator", "iconUrl": ""},
+        "title": f"Title {post_id}",
+        "feeRequired": fee,
+        "publishedDatetime": published_dt,
+        "updatedDatetime": published_dt,
+        "tags": [],
+    }
+
+
 class _FakeClient:
     def __init__(self, *args, **kwargs) -> None:
         self.session = object()
+
+
+class _PagedClient(_FakeClient):
+    def __init__(self, pages: dict[str, dict]) -> None:
+        super().__init__()
+        self.pages = pages
+        self.requested: list[str] = []
+
+    def get(self, url: str):
+        self.requested.append(url)
+        return self.pages[url]
 
 
 class ReliabilityTests(unittest.TestCase):
@@ -171,6 +197,77 @@ class ReliabilityTests(unittest.TestCase):
         finally:
             db.real_close()
 
+    def test_empty_file_list_marks_skipped_not_seen(self):
+        code, settings, db = self._run_with_patches(
+            Path("."),
+            collect_result=[],
+            download_result=DownloadResult(item=_item(), success=True),
+        )
+        try:
+            self.assertEqual(code, 0)
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM seen_posts").fetchone()[0], 0
+            )
+            row = db.execute(
+                "SELECT filter_revision, reason FROM skipped_posts WHERE post_id = ?",
+                ("post1",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["filter_revision"], filter_revision(settings))
+            self.assertEqual(row["reason"], "no_accepted_files")
+        finally:
+            db.real_close()
+
+    def test_run_lock_blocks_overlapping_run_and_releases_after_success(self):
+        item = _item()
+        settings = _settings(Path("."))
+        db = _NonClosingConnection()
+        repo = Repo(db)
+        self.assertTrue(repo.acquire_run_lock("fanbox_monitor", "other", 3600))
+        with patch.object(main, "load_settings", return_value=settings), \
+             patch.object(main, "setup_logging"), \
+             patch.object(main, "open_db", return_value=db), \
+             patch.object(main, "FanboxClient", _FakeClient), \
+             patch.object(main, "_post_streams", return_value=iter([_meta()])), \
+             patch.object(main, "_collect_files_for_post", return_value=[item]), \
+             patch.object(main, "download_file", return_value=DownloadResult(item=item, success=True)), \
+             patch.object(main, "push_run_results"), \
+             patch.object(main, "send_qinglong"):
+            self.assertEqual(main.run(), 0)
+        try:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM downloaded").fetchone()[0], 0
+            )
+            repo.release_run_lock("fanbox_monitor", "other")
+
+            with patch.object(main, "load_settings", return_value=settings), \
+                 patch.object(main, "setup_logging"), \
+                 patch.object(main, "open_db", return_value=db), \
+                 patch.object(main, "FanboxClient", _FakeClient), \
+                 patch.object(main, "_post_streams", return_value=iter([_meta()])), \
+                 patch.object(main, "_collect_files_for_post", return_value=[item]), \
+                 patch.object(
+                     main,
+                     "download_file",
+                     return_value=DownloadResult(
+                         item=item,
+                         success=True,
+                         local_path="downloads/post1/1.jpg",
+                         size=123,
+                     ),
+                 ), \
+                 patch.object(main, "push_run_results"), \
+                 patch.object(main, "send_qinglong"):
+                self.assertEqual(main.run(), 0)
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM downloaded").fetchone()[0], 1
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM run_lock").fetchone()[0], 0
+            )
+        finally:
+            db.real_close()
+
     def test_supporting_home_failure_propagates(self):
         db = _NonClosingConnection()
         repo = Repo(db)
@@ -182,6 +279,110 @@ class ReliabilityTests(unittest.TestCase):
             ):
                 with self.assertRaises(FanboxAPIError):
                     list(iter_new_supporting(_FakeClient(), repo, settings))
+        finally:
+            db.real_close()
+
+    def test_filter_skip_is_re_evaluated_when_rules_change(self):
+        db = _NonClosingConnection()
+        repo = Repo(db)
+        meta = _meta()
+        settings = _settings(Path("."))
+        settings.fee_min = 100
+        try:
+            self.assertFalse(filter_and_mark(meta, repo, settings))
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM seen_posts").fetchone()[0], 0
+            )
+            first_revision = filter_revision(settings)
+            self.assertTrue(repo.is_skipped(meta.post_id, first_revision))
+
+            settings.fee_min = 0
+            second_revision = filter_revision(settings)
+            self.assertNotEqual(first_revision, second_revision)
+            self.assertFalse(repo.is_skipped(meta.post_id, second_revision))
+            self.assertTrue(filter_and_mark(meta, repo, settings))
+        finally:
+            db.real_close()
+
+    def test_post_streams_rechecks_previous_filter_skips(self):
+        db = _NonClosingConnection()
+        repo = Repo(db)
+        old_settings = _settings(Path("."))
+        old_settings.fee_min = 100
+        meta = _meta()
+        try:
+            self.assertFalse(filter_and_mark(meta, repo, old_settings))
+
+            new_settings = _settings(Path("."))
+            new_settings.mode_supporting = False
+            posts = list(main._post_streams(_FakeClient(), repo, new_settings))
+
+            self.assertEqual([post.post_id for post in posts], ["post1"])
+            self.assertFalse(repo.is_skipped("post1", filter_revision(new_settings)))
+        finally:
+            db.real_close()
+
+    def test_supporting_cursor_stops_at_previous_boundary_and_updates_scope(self):
+        db = _NonClosingConnection()
+        repo = Repo(db)
+        settings = _settings(Path("."))
+        revision = filter_revision(settings)
+        repo.set_cursor("supporting:" + revision, "2026-01-02T00:00:00+00:00", "old")
+        pages = [
+            {
+                "body": {
+                    "items": [
+                        _raw_post("new", "2026-01-03T00:00:00+00:00"),
+                        _raw_post("old", "2026-01-02T00:00:00+00:00"),
+                    ],
+                    "nextUrl": "next",
+                }
+            }
+        ]
+        try:
+            with patch("crawler.supporting.list_supporting_posts", return_value=pages[0]):
+                posts = list(iter_new_supporting(_FakeClient(), repo, settings))
+
+            self.assertEqual([post.post_id for post in posts], ["new"])
+            cursor_dt, cursor_id = repo.get_cursor("supporting:" + revision)
+            self.assertEqual(cursor_dt, "2026-01-03T00:00:00+00:00")
+            self.assertEqual(cursor_id, "new")
+        finally:
+            db.real_close()
+
+    def test_supporting_continues_past_seen_page_without_cursor(self):
+        db = _NonClosingConnection()
+        repo = Repo(db)
+        settings = _settings(Path("."))
+        repo.mark_seen(
+            "seen",
+            "creator1",
+            "2026-01-03T00:00:00+00:00",
+            0,
+            "Seen",
+        )
+        first_page = {
+            "body": {
+                "items": [_raw_post("seen", "2026-01-03T00:00:00+00:00")],
+                "nextUrl": "next",
+            }
+        }
+        second_page = {
+            "body": {
+                "items": [_raw_post("new", "2026-01-02T00:00:00+00:00")],
+                "nextUrl": None,
+            }
+        }
+        client = _PagedClient({"next": second_page})
+        try:
+            with patch("crawler.supporting.list_supporting_posts", return_value=first_page):
+                posts = list(iter_new_supporting(client, repo, settings))
+
+            self.assertEqual(client.requested, ["next"])
+            self.assertEqual([post.post_id for post in posts], ["new"])
+            cursor_dt, cursor_id = repo.get_cursor("supporting:" + filter_revision(settings))
+            self.assertEqual(cursor_dt, "2026-01-03T00:00:00+00:00")
+            self.assertEqual(cursor_id, "seen")
         finally:
             db.real_close()
 
