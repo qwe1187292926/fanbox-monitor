@@ -16,6 +16,7 @@ from typing import Optional
 from curl_cffi import requests as curl_requests
 
 from config import Settings
+from error_summary import simplify_error
 from i18n import t
 from models.types import DownloadResult, FileItem
 from parser.filename import render_filename
@@ -99,14 +100,14 @@ def download_file(
                 timeout=TIMEOUT,
             )
         except Exception as exc:
-            last_error = f"net error: {exc}"
+            last_error = simplify_error(exc, settings.lang)
             logger.warning(
                 t(
                     settings.lang,
                     "download.net_failed",
                     url=url,
                     attempt=attempt + 1,
-                    error=exc,
+                    error=last_error,
                 )
             )
             _backoff_sleep(attempt)
@@ -185,13 +186,13 @@ def download_file(
             # 写入过程中网络中断 / HTTP/2 stream reset 等。
             # **不删 .part**，下次循环用 Range 续传。
             now_size = _tmp_size(tmp)
-            last_error = f"write error: {exc}"
+            last_error = simplify_error(exc, settings.lang)
             logger.warning(
                 t(
                     settings.lang,
                     "download.write_interrupted",
                     target=target,
-                    error=exc,
+                    error=last_error,
                     mib=now_size / 1048576,
                 )
             )

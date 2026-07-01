@@ -56,6 +56,7 @@ class Settings:
     first_run_max_posts: int
     post_403_retries: int
     post_403_backoff_base: float
+    forbidden_fee_infer_threshold: int
     run_lock_ttl_sec: int
 
     # Bark 通知（可选）。设了 device_key 就额外走 Bark per-creator 通知（带头像）。
@@ -223,6 +224,9 @@ def load_settings(project_root: Optional[Path] = None) -> Settings:
     post_403_backoff_base = max(
         0.0, _env_float("FANBOX_POST_403_BACKOFF_BASE", 30.0)
     )
+    forbidden_fee_infer_threshold = max(
+        0, _env_int("FANBOX_FORBIDDEN_FEE_INFER_THRESHOLD", 2)
+    )
     run_lock_ttl_sec = max(60, _env_int("FANBOX_RUN_LOCK_TTL_SEC", 21600))
 
     return Settings(
@@ -245,6 +249,7 @@ def load_settings(project_root: Optional[Path] = None) -> Settings:
         first_run_max_posts=first_run_max_posts,
         post_403_retries=post_403_retries,
         post_403_backoff_base=post_403_backoff_base,
+        forbidden_fee_infer_threshold=forbidden_fee_infer_threshold,
         run_lock_ttl_sec=run_lock_ttl_sec,
         bark_server=(os.environ.get("FANBOX_BARK_SERVER") or "https://api.day.app").rstrip("/"),
         bark_device_key=(os.environ.get("FANBOX_BARK_DEVICE_KEY") or "").strip(),

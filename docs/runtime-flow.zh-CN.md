@@ -15,9 +15,11 @@
    - 已在 `seen_posts` 中的投稿直接跳过。
    - 当前过滤规则版本下已在 `skipped_posts` 中的投稿直接跳过。
    - 旧过滤规则版本下跳过、但当前版本尚未评估的投稿会先被重新评估。
+   - 最新状态为 `access_forbidden` 的投稿会在每次运行开头重新评估，不受 supporting / following cursor 限制。
    - 对未见投稿先做价格、日期、tag、creator 规则过滤。
    - 过滤不通过的投稿会写入 `skipped_posts`，同一过滤规则版本下不会重复评估；规则变化后会重新评估。
    - supporting / following 会使用按过滤规则版本隔离的 `cursor` 停止翻页。
+   - 同一运行中，如果同一创作者同一金额的 `post.info` 连续 403 达到 `FANBOX_FORBIDDEN_FEE_INFER_THRESHOLD`，后续该创作者金额大于等于该金额的投稿会直接记录为 `access_forbidden`，留到下次运行再试。
 7. 拉取投稿详情：对通过早期过滤的投稿调用 `post.info`。
 8. 解析文件：把投稿详情解析成可下载的 `FileItem`，并按扩展名白名单过滤。
 9. 提交下载：未在 `downloaded` 中登记的文件会进入线程池下载。
@@ -38,7 +40,7 @@
 | --- | --- | --- | --- |
 | 投稿已经在 `seen_posts` | 直接跳过 | 已经存在 | 否 |
 | 价格、日期、tag、creator 规则过滤不通过 | 写入当前规则版本的 `skipped_posts` | 否 | 规则变化后重评估 |
-| `post.info` 返回 403 且重试后仍失败 | 当前规则版本下写入 `skipped_posts` | 否 | 规则变化后重评估 |
+| `post.info` 返回 403 且重试后仍失败 | 写入 `skipped_posts.reason=access_forbidden` | 否 | 是，每次运行开头重试 |
 | `post.info` 网络错误、5xx、JSON 错误等临时失败 | 记录错误，保留投稿 | 否 | 是 |
 | 投稿没有可下载文件 | 当前规则版本下写入 `skipped_posts` | 否 | 规则变化后重评估 |
 | 文件 URL 已在 `downloaded` | 跳过该文件 | 取决于投稿整体结果 | 否 |
@@ -48,6 +50,25 @@
 | supporting / following 首页或分页失败 | 向上抛出，让本次 run 失败 | 已成功完成的投稿按下载结果处理 | 是 |
 | Fanbox 401 | 认为 cookie 失效，发送认证失败通知，退出码 `2` | 否 | 修复 cookie 后重试 |
 | Fanbox 429 | 触发限流退避并提前结束本次 run | 否 | 是 |
+
+## 403 权限不足与赞助恢复
+
+`post.info` 返回 403 通常表示当前账号无法访问该投稿详情，例如未赞助、赞助档位不足或限定内容。监控不会把这种投稿写入 `seen_posts`，因为写入后即使之后赞助或升级档位，也会被当作已处理而无法自动下载。
+
+当前处理策略：
+
+- `post.info` 403 会先按 `FANBOX_POST_403_RETRIES` 重试，避免 Fanbox 偶发软限流造成误判。
+- 重试后仍 403 时，投稿写入 `skipped_posts.reason=access_forbidden`。
+- `access_forbidden` 不受 cursor 限制，每次运行开头都会重新评估。
+- 后续账号获得访问权限后，该投稿会正常解析文件、下载，并在全部文件成功后写入 `seen_posts`。
+- 如果重新评估时详情可访问但没有符合白名单的文件，会改写为普通的 `no_accepted_files` 跳过状态。
+
+同一次运行内还会做创作者金额推断，减少无效详情请求：
+
+- 当同一创作者、同一 `fee` 的投稿连续 403 达到 `FANBOX_FORBIDDEN_FEE_INFER_THRESHOLD`，本次运行会认为该创作者当前账号暂时无法访问这个金额及以上的投稿。
+- 后续同一创作者 `fee >= 推断金额` 的投稿不再请求 `post.info`，直接记录为 `access_forbidden`。
+- 这个推断只在当前 run 内有效，不会持久化。下一次运行仍会重新尝试，因此赞助或升级档位后可以自动恢复下载。
+- 设置 `FANBOX_FORBIDDEN_FEE_INFER_THRESHOLD=0` 可以关闭该优化。
 
 ## 下载策略
 
@@ -128,7 +149,7 @@ python download_post.py 123456
 
 ### `skipped_posts`
 
-记录在某个过滤规则版本下被跳过的投稿。过滤规则版本由全局过滤、扩展名白名单和 per-creator 规则生成；规则变化后，旧版本的跳过记录会被重新评估。
+记录在某个过滤规则版本下被跳过的投稿。过滤规则版本由全局过滤、扩展名白名单和 per-creator 规则生成；规则变化后，旧版本的过滤跳过记录会被重新评估。`reason=access_forbidden` 表示当前账号暂时无权访问详情，会在后续运行继续重试。
 
 | 字段 | 类型 | 约束 | 含义 |
 | --- | --- | --- | --- |

@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -37,13 +37,14 @@ from crawler.following import iter_new_following
 from crawler.interval import CrawlInterval
 from crawler.supporting import iter_new_supporting
 from downloader.http_downloader import download_file
+from error_summary import is_common_error, simplify_error
 from i18n import t
 from models.types import CreatorInfo, DownloadResult, FileItem, PostMeta, RunStats
 from notify.push import format_run_summary, push_run_results, send_qinglong
 from parser.filter import accept_file
 from parser.post_parser import parse_post
 from storage.db import open_db
-from storage.repo import Repo
+from storage.repo import ACCESS_FORBIDDEN_REASON, Repo
 
 
 logger = logging.getLogger("fanbox_monitor")
@@ -53,6 +54,39 @@ logger = logging.getLogger("fanbox_monitor")
 class _PostDownloadState:
     meta: PostMeta
     failed: bool = False
+
+
+class PostAccessForbidden(Exception):
+    """post.info returned 403 after retries; retry it in a future run."""
+
+
+@dataclass
+class _ForbiddenFeeTracker:
+    threshold: int
+    failures: dict[tuple[str, int], int] = field(default_factory=dict)
+    blocked_min_fee: dict[str, int] = field(default_factory=dict)
+
+    def blocked_fee_for(self, meta: PostMeta) -> Optional[int]:
+        if self.threshold <= 0:
+            return None
+        blocked_fee = self.blocked_min_fee.get(meta.creator_id)
+        if blocked_fee is None or meta.fee < blocked_fee:
+            return None
+        return blocked_fee
+
+    def record_forbidden(self, meta: PostMeta) -> Optional[tuple[int, int]]:
+        if self.threshold <= 0 or meta.fee <= 0:
+            return None
+        key = (meta.creator_id, meta.fee)
+        count = self.failures.get(key, 0) + 1
+        self.failures[key] = count
+        if count < self.threshold:
+            return None
+        previous = self.blocked_min_fee.get(meta.creator_id)
+        if previous is not None and previous <= meta.fee:
+            return None
+        self.blocked_min_fee[meta.creator_id] = meta.fee
+        return meta.fee, count
 
 
 def _redact_proxy(proxy: Optional[str], lang: str | None = None) -> str:
@@ -163,8 +197,13 @@ def _finalize_downloads(
             if state is not None:
                 state.failed = True
             stats.errors += 1
-            stats.error_messages.append(f"{item.url}: {exc}")
-            logger.exception(t(lang, "main.download_task_exception", url=item.url))
+            summary = simplify_error(f"{item.url}: {exc}", lang)
+            stats.error_messages.append(summary)
+            logger.error(
+                t(lang, "main.download_task_exception", url=item.url)
+                + f"\n{summary}"
+            )
+            logger.debug("download task stack trace", exc_info=True)
             continue
 
         if result.success and result.skipped_reason is None:
@@ -187,7 +226,9 @@ def _finalize_downloads(
                 state.failed = True
             stats.errors += 1
             if result.error:
-                stats.error_messages.append(f"{item.url}: {result.error}")
+                stats.error_messages.append(
+                    simplify_error(f"{item.url}: {result.error}", lang)
+                )
 
     for state in post_states.values():
         meta = state.meta
@@ -276,12 +317,12 @@ def _collect_files_for_post(
             logger.info(
                 t(
                     settings.lang,
-                    "main.post_403_skip",
+                    "main.post_403_access_forbidden",
                     post_id=meta.post_id,
                     max_retries=max_retries,
                 )
             )
-            return []
+            raise PostAccessForbidden(str(exc)) from exc
         except FanboxError as exc:
             logger.warning(
                 t(settings.lang, "main.detail_fetch_failed", post_id=meta.post_id, error=exc)
@@ -300,11 +341,31 @@ def _collect_files_for_post(
     return [f for f in files if accept_file(f, settings.ext_whitelist)]
 
 
+def _mark_access_forbidden(repo: Repo, settings: Settings, meta: PostMeta) -> None:
+    repo.mark_skipped(
+        meta.post_id,
+        filter_revision(settings),
+        meta.creator_id,
+        meta.published_dt,
+        meta.fee,
+        meta.title,
+        ACCESS_FORBIDDEN_REASON,
+        updated_dt=meta.updated_dt,
+        user_name=meta.user_name,
+        user_icon_url=meta.user_icon_url,
+        tags=meta.tags,
+    )
+
+
 def _post_streams(
     client: FanboxClient, repo: Repo, settings: Settings
 ) -> Iterator[PostMeta]:
     """根据开关串接 supporting + following。"""
     revision = filter_revision(settings)
+    for meta in repo.iter_access_forbidden_for_recheck():
+        if filter_and_mark(meta, repo, settings):
+            yield meta
+
     for meta in repo.iter_skipped_for_recheck(revision):
         if filter_and_mark(meta, repo, settings):
             yield meta
@@ -365,6 +426,9 @@ def run() -> int:
             # 全局配额：本次 run 总共最多处理多少条新投稿（0 = 无限）
             quota_limit = settings.first_run_max_posts
             quota_used = 0
+            forbidden_fee_tracker = _ForbiddenFeeTracker(
+                settings.forbidden_fee_infer_threshold
+            )
             if quota_limit > 0:
                 logger.info(t(settings.lang, "main.quota_limit", limit=quota_limit))
 
@@ -378,6 +442,21 @@ def run() -> int:
                     logger.info(t(settings.lang, "main.quota_reached", limit=quota_limit))
                     break
 
+                blocked_fee = forbidden_fee_tracker.blocked_fee_for(meta)
+                if blocked_fee is not None:
+                    logger.info(
+                        t(
+                            settings.lang,
+                            "main.forbidden_fee_skip",
+                            creator_id=meta.creator_id,
+                            post_id=meta.post_id,
+                            fee=meta.fee,
+                            blocked_fee=blocked_fee,
+                        )
+                    )
+                    _mark_access_forbidden(repo, settings, meta)
+                    continue
+
                 try:
                     files = _collect_files_for_post(client, settings, meta)
                 except FanboxAuthError:
@@ -385,12 +464,35 @@ def run() -> int:
                 except FanboxRateLimitError:
                     logger.error(t(settings.lang, "main.rate_limit_stop"))
                     stats.errors += 1
-                    stats.error_messages.append("rate_limit")
+                    stats.error_messages.append(
+                        simplify_error("rate_limit", settings.lang)
+                    )
                     break
+                except PostAccessForbidden:
+                    inferred = forbidden_fee_tracker.record_forbidden(meta)
+                    if inferred is not None:
+                        inferred_fee, count = inferred
+                        logger.info(
+                            t(
+                                settings.lang,
+                                "main.forbidden_fee_inferred",
+                                creator_id=meta.creator_id,
+                                fee=inferred_fee,
+                                count=count,
+                            )
+                        )
+                    _mark_access_forbidden(repo, settings, meta)
+                    quota_used += 1
+                    continue
 
                 if files is None:
                     stats.errors += 1
-                    stats.error_messages.append(f"{meta.post_id}: detail_fetch_failed")
+                    stats.error_messages.append(
+                        simplify_error(
+                            f"{meta.post_id}: detail_fetch_failed",
+                            settings.lang,
+                        )
+                    )
                     continue
 
                 quota_used += 1
@@ -455,8 +557,16 @@ def run() -> int:
                     except Exception as exc:
                         state.failed = True
                         stats.errors += 1
-                        stats.error_messages.append(f"{item.url}: submit_failed: {exc}")
-                        logger.exception(t(settings.lang, "main.submit_download_failed", url=item.url))
+                        summary = simplify_error(
+                            f"{item.url}: submit_failed: {exc}",
+                            settings.lang,
+                        )
+                        stats.error_messages.append(summary)
+                        logger.error(
+                            t(settings.lang, "main.submit_download_failed", url=item.url)
+                            + f"\n{summary}"
+                        )
+                        logger.debug("download submit stack trace", exc_info=True)
                         continue
                     futures.append((meta, item, fut))
 
@@ -468,12 +578,13 @@ def run() -> int:
             _finalize_downloads(repo, stats, futures, post_states, settings.lang)
             downloads_finalized = True
         stats.errors += 1
-        stats.error_messages.append(f"auth: {exc}")
-        logger.error(t(settings.lang, "main.auth_failed", error=exc))
+        summary = simplify_error(exc, settings.lang)
+        stats.error_messages.append(summary)
+        logger.error(t(settings.lang, "main.auth_failed", error=summary))
         try:
             send_qinglong(
                 t(settings.lang, "main.auth_notify_title"),
-                t(settings.lang, "main.auth_notify_body", error=exc),
+                t(settings.lang, "main.auth_notify_body", error=summary),
                 settings.lang,
             )
         finally:
@@ -485,8 +596,13 @@ def run() -> int:
             _finalize_downloads(repo, stats, futures, post_states, settings.lang)
             downloads_finalized = True
         stats.errors += 1
-        stats.error_messages.append(f"unhandled: {exc}")
-        logger.exception(t(settings.lang, "main.unhandled_exception", error=exc))
+        summary = simplify_error(exc, settings.lang)
+        stats.error_messages.append(summary)
+        if is_common_error(exc):
+            logger.error(t(settings.lang, "main.unhandled_exception", error=summary))
+            logger.debug("unhandled stack trace", exc_info=True)
+        else:
+            logger.exception(t(settings.lang, "main.unhandled_exception", error=summary))
 
     stats.ended_at = int(time.time())
 

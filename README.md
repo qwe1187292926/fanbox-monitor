@@ -198,6 +198,8 @@ Complete environment variable reference: [`.env.example`](.env.example)
 - `FANBOX_SESSION`: Session cookie for authentication (required)
 - `FANBOX_DOWNLOAD_DIR`: Download destination directory
 - `FANBOX_LOG_LEVEL`: Logging verbosity (DEBUG/INFO/WARNING/ERROR)
+- `FANBOX_POST_403_RETRIES`: Retry count when `post.info` returns 403. Default: `3`
+- `FANBOX_FORBIDDEN_FEE_INFER_THRESHOLD`: In one run, after this many 403s for the same creator and same fee, skip detail requests for that creator's same-or-higher fee posts. Default: `2`; set `0` to disable
 
 ### Per-Creator Rules
 
@@ -227,6 +229,7 @@ FanboxMonitor follows a modular, pipeline-based architecture:
 - **curl_cffi Integration**: Bypasses Fanbox anti-scraping through Chrome fingerprint emulation
 - **SQLite Persistence**: Four-table schema (`seen_posts`, `downloaded`, `cursor`, `run_log`) records deduplication state, download results, latest scan checkpoints, and execution logs
 - **Exponential Backoff**: 5-6 minute backoff on 429 responses prevents IP bans
+- **Access Recovery**: `post.info` 403 is not written to `seen_posts`; it is recorded as `access_forbidden` and retried in later runs so newly supported or upgraded posts can still download
 - **Retry URL Fallback**: Graceful degradation using thumbnail URLs when primary URLs fail
 
 ### Source Attribution

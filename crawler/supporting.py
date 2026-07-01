@@ -13,6 +13,7 @@ from api.client import FanboxClient
 from api.endpoints import list_supporting_posts
 from config import Settings, filter_revision
 from crawler.incremental import filter_and_mark
+from error_summary import simplify_error
 from i18n import t
 from models.types import PostMeta
 from parser.post_parser import extract_post_meta
@@ -53,7 +54,13 @@ def iter_new_supporting(
     try:
         page = list_supporting_posts(client, limit=300)
     except Exception as exc:
-        logger.error(t(settings.lang, "crawler.supporting_home_failed", error=exc))
+        logger.error(
+            t(
+                settings.lang,
+                "crawler.supporting_home_failed",
+                error=simplify_error(exc, settings.lang),
+            )
+        )
         raise
 
     while True:
@@ -102,7 +109,12 @@ def iter_new_supporting(
             page = client.get(next_url)
         except Exception as exc:
             logger.warning(
-                t(settings.lang, "crawler.supporting_page_failed", url=next_url, error=exc)
+                t(
+                    settings.lang,
+                    "crawler.supporting_page_failed",
+                    url=next_url,
+                    error=simplify_error(exc, settings.lang),
+                )
             )
             raise
 

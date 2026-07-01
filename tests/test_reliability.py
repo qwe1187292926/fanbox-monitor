@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import download_post
 import main
-from api.exceptions import FanboxAPIError
+from api.exceptions import FanboxAPIError, FanboxForbiddenError
 from config import Settings, filter_revision, load_settings
 from crawler.incremental import filter_and_mark
 from crawler.supporting import iter_new_supporting
@@ -53,6 +53,7 @@ def _settings(root: Path) -> Settings:
         first_run_max_posts=50,
         post_403_retries=0,
         post_403_backoff_base=0.0,
+        forbidden_fee_infer_threshold=2,
         run_lock_ttl_sec=3600,
         bark_server="https://api.day.app",
         bark_device_key="",
@@ -218,6 +219,44 @@ class ReliabilityTests(unittest.TestCase):
         finally:
             db.real_close()
 
+    def test_post_403_raises_access_forbidden(self):
+        settings = _settings(Path("."))
+        with patch.object(main, "get_post", side_effect=FanboxForbiddenError("403")):
+            with self.assertRaises(main.PostAccessForbidden):
+                main._collect_files_for_post(_FakeClient(), settings, _meta())
+
+    def test_access_forbidden_marks_retryable_not_seen(self):
+        settings = _settings(Path("."))
+        db = _NonClosingConnection()
+        try:
+            with patch.object(main, "load_settings", return_value=settings), \
+                 patch.object(main, "setup_logging"), \
+                 patch.object(main, "open_db", return_value=db), \
+                 patch.object(main, "FanboxClient", _FakeClient), \
+                 patch.object(main, "_post_streams", return_value=iter([_meta()])), \
+                 patch.object(
+                     main,
+                     "_collect_files_for_post",
+                     side_effect=main.PostAccessForbidden("403"),
+                 ), \
+                 patch.object(main, "download_file") as download_file, \
+                 patch.object(main, "push_run_results"), \
+                 patch.object(main, "send_qinglong"):
+                self.assertEqual(main.run(), 0)
+
+            self.assertEqual(download_file.call_count, 0)
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM seen_posts").fetchone()[0], 0
+            )
+            row = db.execute(
+                "SELECT reason FROM skipped_posts WHERE post_id = ?",
+                ("post1",),
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["reason"], main.ACCESS_FORBIDDEN_REASON)
+        finally:
+            db.real_close()
+
     def test_run_lock_blocks_overlapping_run_and_releases_after_success(self):
         item = _item()
         settings = _settings(Path("."))
@@ -319,6 +358,126 @@ class ReliabilityTests(unittest.TestCase):
 
             self.assertEqual([post.post_id for post in posts], ["post1"])
             self.assertFalse(repo.is_skipped("post1", filter_revision(new_settings)))
+        finally:
+            db.real_close()
+
+    def test_post_streams_rechecks_current_access_forbidden(self):
+        db = _NonClosingConnection()
+        repo = Repo(db)
+        settings = _settings(Path("."))
+        settings.mode_supporting = False
+        meta = _meta()
+        try:
+            repo.mark_skipped(
+                meta.post_id,
+                filter_revision(settings),
+                meta.creator_id,
+                meta.published_dt,
+                meta.fee,
+                meta.title,
+                main.ACCESS_FORBIDDEN_REASON,
+                updated_dt=meta.updated_dt,
+                user_name=meta.user_name,
+                user_icon_url=meta.user_icon_url,
+                tags=meta.tags,
+            )
+
+            posts = list(main._post_streams(_FakeClient(), repo, settings))
+
+            self.assertEqual([post.post_id for post in posts], ["post1"])
+        finally:
+            db.real_close()
+
+    def test_access_forbidden_history_can_download_after_permission_changes(self):
+        db = _NonClosingConnection()
+        repo = Repo(db)
+        settings = _settings(Path("."))
+        settings.mode_supporting = False
+        meta = _meta()
+        item = _item()
+        try:
+            repo.mark_skipped(
+                meta.post_id,
+                filter_revision(settings),
+                meta.creator_id,
+                meta.published_dt,
+                meta.fee,
+                meta.title,
+                main.ACCESS_FORBIDDEN_REASON,
+                updated_dt=meta.updated_dt,
+                user_name=meta.user_name,
+                user_icon_url=meta.user_icon_url,
+                tags=meta.tags,
+            )
+
+            with patch.object(main, "load_settings", return_value=settings), \
+                 patch.object(main, "setup_logging"), \
+                 patch.object(main, "open_db", return_value=db), \
+                 patch.object(main, "FanboxClient", _FakeClient), \
+                 patch.object(main, "_collect_files_for_post", return_value=[item]), \
+                 patch.object(
+                     main,
+                     "download_file",
+                     return_value=DownloadResult(
+                         item=item,
+                         success=True,
+                         local_path="downloads/post1/1.jpg",
+                         size=123,
+                     ),
+                 ), \
+                 patch.object(main, "push_run_results"), \
+                 patch.object(main, "send_qinglong"):
+                self.assertEqual(main.run(), 0)
+
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM downloaded").fetchone()[0], 1
+            )
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM seen_posts").fetchone()[0], 1
+            )
+        finally:
+            db.real_close()
+
+    def test_forbidden_fee_inference_skips_same_or_higher_fee_this_run(self):
+        settings = _settings(Path("."))
+        db = _NonClosingConnection()
+        metas = [_meta("p1"), _meta("p2"), _meta("p3"), _meta("p4")]
+        metas[0].fee = 500
+        metas[1].fee = 500
+        metas[2].fee = 1000
+        metas[3].fee = 100
+        try:
+            with patch.object(main, "load_settings", return_value=settings), \
+                 patch.object(main, "setup_logging"), \
+                 patch.object(main, "open_db", return_value=db), \
+                 patch.object(main, "FanboxClient", _FakeClient), \
+                 patch.object(main, "_post_streams", return_value=iter(metas)), \
+                 patch.object(
+                     main,
+                     "_collect_files_for_post",
+                     side_effect=[
+                         main.PostAccessForbidden("403"),
+                         main.PostAccessForbidden("403"),
+                         [],
+                     ],
+                 ) as collect_files, \
+                 patch.object(main, "download_file") as download_file, \
+                 patch.object(main, "push_run_results"), \
+                 patch.object(main, "send_qinglong"):
+                self.assertEqual(main.run(), 0)
+
+            self.assertEqual(collect_files.call_count, 3)
+            self.assertEqual(download_file.call_count, 0)
+            rows = {
+                row["post_id"]: row["reason"]
+                for row in db.execute(
+                    "SELECT post_id, reason FROM skipped_posts"
+                ).fetchall()
+            }
+            self.assertEqual(rows["p1"], main.ACCESS_FORBIDDEN_REASON)
+            self.assertEqual(rows["p2"], main.ACCESS_FORBIDDEN_REASON)
+            self.assertEqual(rows["p3"], main.ACCESS_FORBIDDEN_REASON)
+            self.assertEqual(rows["p4"], "no_accepted_files")
         finally:
             db.real_close()
 
@@ -426,6 +585,26 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(title, "Fanbox new posts 2 / files 3")
         self.assertIn("New files: 3", body)
         self.assertIn("Duration: 5s", body)
+
+    def test_format_run_summary_simplifies_common_tls_errors(self):
+        stats = main.RunStats(
+            started_at=100,
+            ended_at=105,
+            errors=1,
+            error_messages=[
+                "unhandled: 请求失败: https://api.fanbox.cc/post.listSupporting - "
+                "Failed to perform, curl: (35) TLS connect error: "
+                "error:00000000:invalid library (0):OPENSSL_internal:invalid library (0)."
+            ],
+        )
+
+        _, body = format_run_summary(stats, "zh-CN")
+
+        self.assertIn("网络/TLS 连接失败", body)
+        self.assertIn("可能原因:", body)
+        self.assertIn("https://api.fanbox.cc/post.listSupporting", body)
+        self.assertIn("curl 35", body)
+        self.assertNotIn("OPENSSL_internal:invalid library", body)
 
     def test_extract_post_id_accepts_common_inputs(self):
         self.assertEqual(download_post.extract_post_id("123456"), "123456")

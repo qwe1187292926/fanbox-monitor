@@ -8,6 +8,8 @@ from typing import Optional
 
 from models.types import PostMeta
 
+ACCESS_FORBIDDEN_REASON = "access_forbidden"
+
 
 class Repo:
     def __init__(self, conn: sqlite3.Connection) -> None:
@@ -133,6 +135,56 @@ class Repo:
             ORDER BY s.published_dt DESC
             """,
             (filter_revision, filter_revision),
+        )
+        posts: list[PostMeta] = []
+        for row in cur.fetchall():
+            try:
+                tags = json.loads(row["tags"] or "[]")
+            except json.JSONDecodeError:
+                tags = []
+            if not isinstance(tags, list):
+                tags = []
+            posts.append(
+                PostMeta(
+                    post_id=row["post_id"],
+                    creator_id=row["creator_id"],
+                    user_name=row["user_name"],
+                    user_icon_url=row["user_icon_url"],
+                    title=row["title"] or "",
+                    fee=row["fee"],
+                    published_dt=row["published_dt"],
+                    updated_dt=row["updated_dt"],
+                    tags=[str(tag) for tag in tags],
+                )
+            )
+        return posts
+
+    def iter_access_forbidden_for_recheck(self) -> list[PostMeta]:
+        cur = self.conn.execute(
+            """
+            SELECT
+                s.post_id, s.creator_id, s.user_name, s.user_icon_url, s.title,
+                s.fee, s.published_dt, s.updated_dt, s.tags
+            FROM skipped_posts s
+            WHERE s.reason = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM seen_posts seen
+                  WHERE seen.post_id = s.post_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM skipped_posts newer
+                  WHERE newer.post_id = s.post_id
+                    AND (
+                        newer.skipped_at > s.skipped_at
+                        OR (
+                            newer.skipped_at = s.skipped_at
+                            AND newer.filter_revision > s.filter_revision
+                        )
+                    )
+              )
+            ORDER BY s.published_dt DESC
+            """,
+            (ACCESS_FORBIDDEN_REASON,),
         )
         posts: list[PostMeta] = []
         for row in cur.fetchall():

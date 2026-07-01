@@ -14,6 +14,7 @@ from typing import Callable, Optional
 from curl_cffi import requests as curl_requests
 
 from config import Settings
+from error_summary import simplify_error
 from i18n import t
 from models.types import CreatorInfo, RunStats
 
@@ -163,7 +164,9 @@ def format_run_summary(stats: RunStats, lang: str = "zh-CN") -> tuple[str, str]:
         lines.append("")
         lines.append(t(lang, "notify.error_details"))
         for msg in stats.error_messages[:10]:
-            lines.append(f"  - {msg}")
+            for index, line in enumerate(simplify_error(msg, lang).splitlines()):
+                prefix = "  - " if index == 0 else "    "
+                lines.append(f"{prefix}{line}")
 
     return title, "\n".join(lines)
 

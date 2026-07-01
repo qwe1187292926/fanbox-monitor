@@ -14,6 +14,7 @@ from api.client import FanboxClient
 from api.endpoints import list_creator_posts, list_following
 from config import Settings, filter_revision, get_rule_for
 from crawler.incremental import filter_and_mark
+from error_summary import simplify_error
 from i18n import t
 from models.types import PostMeta
 from parser.post_parser import extract_post_meta
@@ -48,7 +49,12 @@ def _iter_creator_posts(
         page = list_creator_posts(client, creator_id, limit=300)
     except Exception as exc:
         logger.warning(
-            t(settings.lang, "crawler.creator_home_failed", creator_id=creator_id, error=exc)
+            t(
+                settings.lang,
+                "crawler.creator_home_failed",
+                creator_id=creator_id,
+                error=simplify_error(exc, settings.lang),
+            )
         )
         raise
 
@@ -112,7 +118,7 @@ def _iter_creator_posts(
                     "crawler.creator_page_failed",
                     creator_id=creator_id,
                     url=next_url,
-                    error=exc,
+                    error=simplify_error(exc, settings.lang),
                 )
             )
             raise
@@ -131,7 +137,13 @@ def iter_new_following(
     try:
         raw = list_following(client)
     except Exception as exc:
-        logger.error(t(settings.lang, "crawler.following_failed", error=exc))
+        logger.error(
+            t(
+                settings.lang,
+                "crawler.following_failed",
+                error=simplify_error(exc, settings.lang),
+            )
+        )
         raise
 
     creators = (raw.get("body") or {}).get("creators") or []

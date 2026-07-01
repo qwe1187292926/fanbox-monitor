@@ -198,6 +198,8 @@ FanboxMonitor/
 - `FANBOX_SESSION`：用于身份验证的会话 Cookie（必需）
 - `FANBOX_DOWNLOAD_DIR`：下载目标目录
 - `FANBOX_LOG_LEVEL`：日志详细程度（DEBUG/INFO/WARNING/ERROR）
+- `FANBOX_POST_403_RETRIES`：`post.info` 返回 403 时的重试次数，默认 `3`
+- `FANBOX_FORBIDDEN_FEE_INFER_THRESHOLD`：同一创作者同一金额连续 403 多少次后，本次运行跳过该创作者更高金额的详情请求；默认 `2`，设为 `0` 关闭
 
 ### 创作者规则
 
@@ -227,6 +229,7 @@ FanboxMonitor 采用模块化、管道化的架构设计：
 - **curl_cffi 集成**：通过 Chrome 指纹模拟绕过 Fanbox 反爬机制
 - **SQLite 持久化**：四表架构（seen_posts、downloaded、cursor、run_log）记录去重状态、下载结果、最近扫描 checkpoint 和执行日志
 - **指数退避**：429 响应时 5-6 分钟退避，防止 IP 封禁
+- **权限不足恢复**：`post.info` 403 不会写入 `seen_posts`，而是记录为 `access_forbidden` 并在后续运行重试，避免赞助或升级档位后漏下载
 - **Retry URL 降级**：主 URL 失败时使用缩略图 URL 优雅降级
 
 ### 源码对照
